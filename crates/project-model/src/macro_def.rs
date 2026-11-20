@@ -22,6 +22,18 @@ pub struct MacroDefSource {
 }
 
 impl MacroDef {
+    pub(crate) fn to_ordered_predefines(&self, manifest_path: &AbsPathBuf) -> Vec<Predefine> {
+        self.sources
+            .iter()
+            .map(|source| {
+                Predefine::with_source(
+                    source.atom.predefine_string(),
+                    PredefineSource { path: manifest_path.clone(), range: source.range },
+                )
+            })
+            .collect()
+    }
+
     pub fn to_predefine_strings(&self) -> Vec<String> {
         self.to_predefines(None).into_iter().map(|predefine| predefine.definition).collect()
     }

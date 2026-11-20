@@ -272,7 +272,7 @@ pub(crate) fn symbol_kind(symbol_kind: DefKind) -> lsp_types::SymbolKind {
         DefKind::Net | DefKind::NetDecl => LspSymbolKind::PROPERTY,
         DefKind::Variable | DefKind::DataDecl | DefKind::Genvar => LspSymbolKind::VARIABLE,
         DefKind::Struct => LspSymbolKind::STRUCT,
-        DefKind::Subroutine | DefKind::Fn => LspSymbolKind::FUNCTION,
+        DefKind::Subroutine | DefKind::DpiImport | DefKind::Fn => LspSymbolKind::FUNCTION,
         DefKind::Config
         | DefKind::Library
         | DefKind::Block

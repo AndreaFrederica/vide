@@ -71,7 +71,7 @@ pub(crate) fn file_macro_coverage_query(db: &dyn PreprocDb, file_id: FileId) -> 
         return Arc::new(MacroCoverage::default());
     }
 
-    let mut model_file_ids = vec![file_id];
+    let mut model_file_ids = vec![db.preprocessor_root(file_id)];
     for model_file_id in &contexts.model_file_ids {
         if !model_file_ids.contains(model_file_id) {
             model_file_ids.push(*model_file_id);

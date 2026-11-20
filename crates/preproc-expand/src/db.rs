@@ -1,11 +1,11 @@
 use base_db::{
     analysis_snapshot::CompilationContext,
     diagnostics_config::{DiagnosticSource, DiagnosticsConfig},
-    project::CompilationProfileId,
+    project::{CompilationProfileId, PreprocessConfig},
     source_db::{SourceFileKind, SourceRootDb},
     source_root::SourceRootId,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     SyntaxTree, SyntaxTreeBuffer,
     compilation::Compilation,
@@ -62,7 +62,7 @@ pub struct CompilationDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCompilationUnit {
     pub syntax_tree: SyntaxTree,
-    pub preprocessor_trace: Option<Trace>,
+    pub preprocessor_trace: Option<Arc<Trace>>,
 }
 
 pub type ParsedProfileUnits = Arc<[(FileId, ParsedCompilationUnit, SyntaxTreeBufferIds)]>;
@@ -70,6 +70,7 @@ pub type ParsedProfileUnits = Arc<[(FileId, ParsedCompilationUnit, SyntaxTreeBuf
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedProfile {
     pub units: ParsedProfileUnits,
+    grouped_trees: Vec<(FileId, SyntaxTree)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,7 +227,7 @@ fn parsed_compilation_unit(db: &dyn PreprocDb, key: PreprocFileQueryKey) -> Pars
             );
             ParsedCompilationUnit {
                 syntax_tree: parsed.tree,
-                preprocessor_trace: Some(parsed.preprocessor_trace),
+                preprocessor_trace: Some(Arc::new(parsed.preprocessor_trace)),
             }
         }
         SourceFileKind::LibraryMap => ParsedCompilationUnit {
@@ -245,7 +246,7 @@ fn parsed_profile(db: &dyn PreprocDb, key: PreprocProfileQueryKey) -> Arc<Parsed
     let profile_id = key.profile_id(db);
     let context = db.compilation_context(profile_id);
     let plan = db.compilation_plan_for_profile(profile_id);
-    let source_buffers = compilation_plan::compilation_source_buffers_for_plan(db, &plan);
+    let mut source_buffers = compilation_plan::compilation_source_buffers_for_plan(db, &plan);
     let root_count = plan.roots.len();
     let _span = tracing::info_span!(
         "slang.profile_parse",
@@ -255,17 +256,70 @@ fn parsed_profile(db: &dyn PreprocDb, key: PreprocProfileQueryKey) -> Arc<Parsed
     )
     .entered();
 
-    let mut session = Compilation::new_with_top_modules(&context.top_modules);
-    session.register_source_buffers(&source_buffers);
+    let mut session =
+        Compilation::new_with_options(&context.top_modules, &context.parameter_overrides);
+    if plan.source_libraries.is_empty() {
+        session.register_source_buffers(&source_buffers);
+    } else {
+        let source_order = plan
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(index, &file)| (source_file_identity(db, file).path, index))
+            .collect::<FxHashMap<_, _>>();
+        source_buffers
+            .sort_by_key(|buffer| source_order.get(&buffer.path).copied().unwrap_or(usize::MAX));
+        let libraries = plan
+            .source_libraries
+            .iter()
+            .map(|(file, name)| (source_file_identity(db, *file).path, name))
+            .collect::<FxHashMap<_, _>>();
+        session.register_source_buffers_with_libraries(&source_buffers, |path| {
+            libraries.get(path).map_or_else(String::new, |name| (*name).clone())
+        });
+    }
     let mut units = Vec::with_capacity(root_count);
-    for file_id in plan.roots.iter().copied() {
+    let mut grouped_trees = Vec::new();
+    if let Some(groups) = &plan.compilation_units {
+        for group in groups.iter().filter(|group| group.len() > 1) {
+            let options =
+                syntax_tree_options_for_profile(&db.compilation_context_for_file(group[0]));
+            let sources =
+                group.iter().map(|&file| source_file_identity(db, file).path).collect::<Vec<_>>();
+            let tree = session.parse_grouped_sources(sources.clone(), &options);
+            let buffers = tree.buffer_ids();
+            let trace = Arc::new(tree.preprocessor_trace());
+            for (&file_id, path) in group.iter().zip(sources) {
+                let projected = Compilation::project_source_file(&tree, &path);
+                units.push((
+                    file_id,
+                    ParsedCompilationUnit {
+                        syntax_tree: projected,
+                        preprocessor_trace: Some(trace.clone()),
+                    },
+                    buffers.clone(),
+                ));
+            }
+            grouped_trees.push((group[0], tree));
+        }
+    }
+    let grouped_files = units.iter().map(|(file, _, _)| *file).collect::<FxHashSet<_>>();
+    for (index, file_id) in plan.roots.iter().copied().enumerate() {
+        if grouped_files.contains(&file_id) {
+            continue;
+        }
         let identity = source_file_identity(db, file_id);
         let (syntax_tree, preprocessor_trace) = match db.file_kind(file_id) {
             SourceFileKind::SystemVerilog => {
-                let options = syntax_tree_options_for_profile(&context);
-                let syntax_tree =
-                    session.parse_syntax_tree_from_buffer(&identity.name, &identity.path, &options);
-                let preprocessor_trace = Some(syntax_tree.preprocessor_trace());
+                let options =
+                    syntax_tree_options_for_profile(&db.compilation_context_for_file(file_id));
+                let syntax_tree = session.parse_syntax_tree_from_buffer(
+                    &identity.name,
+                    &identity.path,
+                    &options,
+                    index >= plan.primary_roots().len(),
+                );
+                let preprocessor_trace = Some(Arc::new(syntax_tree.preprocessor_trace()));
                 (syntax_tree, preprocessor_trace)
             }
             SourceFileKind::LibraryMap => {
@@ -304,7 +358,7 @@ fn parsed_profile(db: &dyn PreprocDb, key: PreprocProfileQueryKey) -> Arc<Parsed
         parse_mode = "authoritative",
         "profile authoritative parse complete"
     );
-    Arc::new(ParsedProfile { units: Arc::from(units) })
+    Arc::new(ParsedProfile { units: Arc::from(units), grouped_trees })
 }
 
 #[salsa::tracked(lru = 128, returns(clone))]
@@ -422,7 +476,13 @@ pub trait PreprocDb: SourceRootDb {}
 
 impl dyn PreprocDb + '_ {
     pub fn compilation_plan_for_root(&self, source_root_id: SourceRootId) -> Arc<CompilationPlan> {
-        compilation_plan_for_root(self, source_root_id)
+        let config = self.project_config();
+        if let Some(profile_id) = config.profile_for_root(source_root_id)
+            && config.profile(profile_id).is_some_and(|profile| !profile.source_roots.is_empty())
+        {
+            return self.compilation_plan_for_profile(Some(profile_id));
+        }
+        Arc::new(CompilationPlan::for_source_root(self, source_root_id))
     }
 
     pub fn compilation_plan_for_profile(
@@ -443,6 +503,37 @@ impl dyn PreprocDb + '_ {
         compilation_context_for_file(self, file_id)
     }
 
+    pub fn trace_compilation_files(
+        &self,
+        file: FileId,
+        plan: &CompilationPlan,
+    ) -> (Vec<FileId>, bool) {
+        if plan.compilation_units.is_none() {
+            return (
+                plan.all_file_ids(),
+                plan.include_scan_issues.is_empty() && plan.missing_ordered_sources.is_empty(),
+            );
+        }
+        let profile = self.file_compilation_profile(file);
+        trace_compilation_files(self, PreprocProfileQueryKey::new(self, profile))
+    }
+
+    pub(crate) fn preprocess_for_source_file(&self, file_id: FileId) -> PreprocessConfig {
+        let profile = self.file_compilation_profile(file_id);
+        let config = self.project_config();
+        let mut preprocess = config.preprocess_for_profile(profile);
+        if config
+            .explicit_inputs(profile)
+            .is_some_and(|inputs| inputs.compilation_unit_options.is_some())
+            && let Some(unit) =
+                self.compilation_plan_for_profile(profile).unit_options_for_file(file_id)
+        {
+            preprocess.predefines.extend(unit.predefines.iter().cloned());
+            preprocess.include_dirs.extend(unit.include_dirs.iter().cloned());
+        }
+        preprocess
+    }
+
     pub fn compilation_profile_diagnostics(
         &self,
         profile_id: CompilationProfileId,
@@ -461,7 +552,20 @@ impl dyn PreprocDb + '_ {
         &self,
         file_id: FileId,
     ) -> Arc<Result<MappedSourcePreprocModel, SourcePreprocQueryError>> {
-        source_preproc_model(self, PreprocFileQueryKey::new(self, file_id))
+        source_preproc_model(self, PreprocFileQueryKey::new(self, self.preprocessor_root(file_id)))
+    }
+
+    pub(crate) fn preprocessor_root(&self, file_id: FileId) -> FileId {
+        let profile = self.file_compilation_profile(file_id);
+        if self
+            .project_config()
+            .explicit_inputs(profile)
+            .is_some_and(|inputs| inputs.compilation_units.is_some())
+        {
+            self.compilation_plan_for_profile(profile).preprocessor_root(file_id)
+        } else {
+            file_id
+        }
     }
 
     pub fn source_preproc_context_index_for_profile(
@@ -558,13 +662,6 @@ fn parse(db: &dyn PreprocDb, file_id: HirFileId) -> SyntaxTree {
     }
 }
 
-fn compilation_plan_for_root(
-    db: &dyn PreprocDb,
-    source_root_id: SourceRootId,
-) -> Arc<CompilationPlan> {
-    Arc::new(CompilationPlan::for_source_root(db, source_root_id))
-}
-
 #[salsa::tracked(lru = 32, returns(clone))]
 fn compilation_plan_for_profile(
     db: &dyn PreprocDb,
@@ -585,19 +682,79 @@ fn compilation_context(
         .copied()
         .filter(|file_id| matches!(db.file_kind(*file_id), SourceFileKind::LibraryMap))
         .collect::<Vec<_>>();
-    Arc::new(CompilationContext::new(
+    let mut context = CompilationContext::new(
         profile_id,
         plan.roots.clone(),
         plan.include_dirs.clone(),
         plan.predefines.clone(),
         library_maps,
         plan.top_modules.clone(),
-    ))
+    );
+    context.parameter_overrides = plan.parameter_overrides.clone().into();
+    Arc::new(context)
 }
 
 fn compilation_context_for_file(db: &dyn PreprocDb, file_id: FileId) -> Arc<CompilationContext> {
     let profile_id = db.file_compilation_profile(file_id);
-    db.compilation_context(profile_id)
+    let context = db.compilation_context(profile_id);
+    if db
+        .project_config()
+        .explicit_inputs(profile_id)
+        .is_none_or(|inputs| inputs.compilation_unit_options.is_none())
+    {
+        return context;
+    }
+    let preprocess = db.preprocess_for_source_file(file_id);
+    let mut context = (*context).clone();
+    context.predefines = preprocess.predefine_strings().into();
+    context.include_dirs = preprocess.include_dirs.into();
+    Arc::new(context)
+}
+
+#[salsa::tracked(lru = 128, returns(clone))]
+fn trace_compilation_files(db: &dyn PreprocDb, key: PreprocProfileQueryKey) -> (Vec<FileId>, bool) {
+    let profile = key.profile_id(db);
+    let plan = db.compilation_plan_for_profile(profile);
+    let parsed = db.parsed_profile(profile);
+    let file_ids = path_file_ids(db);
+    let groups =
+        parsed.grouped_trees.iter().map(|(file, tree)| (*file, tree)).collect::<FxHashMap<_, _>>();
+    let mut files = plan.roots.clone();
+    let mut complete = plan.missing_ordered_sources.is_empty();
+    for (file, unit, _) in parsed.units.iter() {
+        if plan.preprocessor_root(*file) != *file {
+            continue;
+        }
+        let Some(trace) = &unit.preprocessor_trace else {
+            continue;
+        };
+        let includes = trace
+            .include_edges
+            .iter()
+            .map(|edge| edge.included_buffer_id)
+            .collect::<FxHashSet<_>>();
+        for buffer in
+            trace.source_buffers.iter().filter(|buffer| includes.contains(&buffer.buffer_id))
+        {
+            if let Some(included) = file_ids.get(&buffer.path) {
+                files.push(included);
+            } else {
+                complete = false;
+            }
+        }
+        let tree = groups.get(file).copied().unwrap_or(&unit.syntax_tree);
+        if tree.diagnostics(&[]).iter().any(|diagnostic| {
+            matches!(
+                diagnostic.name.as_str(),
+                "CouldNotOpenIncludeFile" | "ExpectedIncludeFileName"
+            )
+        }) {
+            complete = false;
+        }
+    }
+    files.sort_unstable_by_key(|file| file.index());
+    files.dedup();
+    (files, complete)
 }
 
 fn compilation_profile_diagnostics(
@@ -615,12 +772,31 @@ fn compilation_profile_diagnostics(
 
     let context = db.compilation_context(Some(profile_id));
     let parsed_profile = db.parsed_profile(Some(profile_id));
-    let mut compilation = Compilation::new_with_top_modules(&context.top_modules);
+    let mut compilation =
+        Compilation::new_with_options(&context.top_modules, &context.parameter_overrides);
     let mut buffer_file_ids = FxHashMap::default();
     let path_file_ids = path_file_ids(db);
 
-    for (file_id, parsed_unit, buffer_ids) in parsed_profile.units.iter() {
-        compilation.add_syntax_tree(&parsed_unit.syntax_tree);
+    let plan = db.compilation_plan_for_profile(Some(profile_id));
+    let parsed_by_file = parsed_profile
+        .units
+        .iter()
+        .map(|(file, unit, buffers)| (*file, (unit, buffers)))
+        .collect::<FxHashMap<_, _>>();
+    let primary_units = plan
+        .compilation_units
+        .as_ref()
+        .map(|units| units.iter().map(|unit| unit[0]).collect::<Vec<_>>());
+    let roots = primary_units.as_deref().unwrap_or_else(|| plan.primary_roots());
+    let groups = parsed_profile
+        .grouped_trees
+        .iter()
+        .map(|(file, tree)| (*file, tree))
+        .collect::<FxHashMap<_, _>>();
+    for file_id in plan.library_maps().iter().chain(roots).chain(plan.library_roots()) {
+        let (parsed_unit, buffer_ids) = parsed_by_file[file_id];
+        compilation
+            .add_syntax_tree(groups.get(file_id).copied().unwrap_or(&parsed_unit.syntax_tree));
         let buffer_ids_for_map = buffer_ids.clone();
         insert_buffer_file_ids(&mut buffer_file_ids, &path_file_ids, buffer_ids_for_map, *file_id);
     }
@@ -1100,6 +1276,7 @@ mod tests {
         assert!(db.parse_diagnostics(MANIFEST).is_empty());
 
         let plan = db.compilation_plan_for_root(ROOT);
+        assert!(Arc::ptr_eq(&plan, &db.compilation_plan_for_profile(Some(CompilationProfileId(0)))));
         assert_eq!(plan.roots, vec![TOP]);
         assert!(!plan.include_only.contains(&MANIFEST));
 

@@ -166,6 +166,7 @@ pub(super) fn make_snapshot(
     GlobalStateSnapshot {
         config: Arc::clone(config),
         workspaces: Arc::clone(workspaces),
+        workspace_ready: workspace.workspace_vfs.is_ready(),
         analysis,
         vfs: Arc::clone(vfs),
         mem_docs: analysis_state.mem_docs.clone(),

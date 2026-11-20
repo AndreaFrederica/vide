@@ -187,7 +187,61 @@ fn resolve_name_inner(
         }
     }
 
-    let unit = db.unit_scope().lookup(ctx, ident);
+    let file = cont_id.file(db).as_file();
+    let explicit_profile = file.and_then(|file| {
+        let profile = db.file_compilation_profile(file);
+        db.project_config()
+            .explicit_inputs(profile)
+            .is_some_and(|inputs| inputs.compilation_units.is_some())
+            .then_some((file, profile))
+    });
+    let mut unit = db.unit_scope().lookup(ctx, ident);
+    if let Some((file, profile)) = explicit_profile {
+        let plan = db.compilation_plan_for_profile(profile);
+        if let Some(files) = plan
+            .compilation_units
+            .as_ref()
+            .and_then(|units| units.iter().find(|unit| unit.contains(&file)))
+        {
+            let position = files.iter().position(|member| *member == file).unwrap();
+            let outside_file = files[..position]
+                .iter()
+                .rev()
+                .chain(files[position + 1..].iter().filter(|_| is_call))
+                .copied();
+            for member in outside_file {
+                let Some(owner) = db.owner_table(HirFileId::File(member)).file_owner() else {
+                    continue;
+                };
+                let scope = db.scope(owner);
+                let resolved = scope.lookup(ctx, ident).or_else(|| {
+                    resolve_scope_imports(
+                        db,
+                        &scope,
+                        ident,
+                        ctx,
+                        owner,
+                        None,
+                        AtFilter { reference: None },
+                    )
+                });
+                if !resolved.is_unresolved() {
+                    return resolved;
+                }
+            }
+        }
+        unit = Resolution::from_candidates(unit.into_candidates().into_iter().filter(|def| {
+            matches!(
+                def.kind(db),
+                DefKind::Module
+                    | DefKind::Interface
+                    | DefKind::Program
+                    | DefKind::Package
+                    | DefKind::Udp
+                    | DefKind::Config
+            )
+        }));
+    }
     if let Some(trace) = trace {
         trace.entries.push(ResolutionTraceEntry {
             phase: ResolutionPhase::Unit,
@@ -337,10 +391,109 @@ pub fn resolve_child_name(
             }
         }
         if ctx == NameContext::Value {
+            if let Some((owner, interface, modport)) = def_id.interface_port(db) {
+                return interface
+                    .and_then(|interface| {
+                        interface_member_resolution(
+                            db,
+                            owner,
+                            &interface,
+                            modport.as_ref(),
+                            ident,
+                            false,
+                        )
+                    })
+                    .unwrap_or(Resolution::Unresolved);
+            }
             return resolve_aggregate_member(db, def_id, ident);
         }
         Resolution::Unresolved
     })
+}
+
+/// Trace aliases as accesses to their underlying declarations. General
+/// reference resolution keeps explicit alias spellings independent of Rename.
+pub fn resolve_interface_operand(
+    db: &dyn HirDefDb,
+    port: DefId,
+    name: &Ident,
+) -> Option<Vec<(DefId, Option<[i32; 2]>)>> {
+    let (owner, interface, modport) = port.interface_port(db)?;
+    let definition = resolve_name(db, owner, interface.as_ref()?, NameContext::Type).unique()?;
+    if definition.kind(db) != DefKind::Interface { return None; }
+    interface_scope_member(db, definition, modport.as_ref(), name, true)?
+        .into_iter()
+        .map(|(resolved, range)| Some((resolved.unique()?, range)))
+        .collect()
+}
+
+pub fn resolve_generic_interface_operand(
+    db: &dyn HirDefDb,
+    port: DefId,
+    instance_type: DefId,
+    actual_modport: Option<&Ident>,
+    name: &Ident,
+) -> Option<Vec<(DefId, Option<[i32; 2]>)>> {
+    let (_, interface, modport) = port.interface_port(db)?;
+    if interface.is_some() || modport.is_some() || instance_type.kind(db) != DefKind::Interface {
+        return None;
+    }
+    interface_scope_member(db, instance_type, actual_modport, name, true)?
+        .into_iter()
+        .map(|(resolved, range)| Some((resolved.unique()?, range)))
+        .collect()
+}
+
+fn interface_member_resolution(
+    db: &dyn HirDefDb,
+    owner: OwnerId,
+    interface: &Ident,
+    modport: Option<&Ident>,
+    name: &Ident,
+    allow_alias: bool,
+) -> Option<Resolution<DefId>> {
+    let interface = resolve_name(db, owner, interface, NameContext::Type).unique()?;
+    if interface.kind(db) != DefKind::Interface {
+        return None;
+    }
+    interface_scope_member(db, interface, modport, name, allow_alias)?.pop().map(|(resolved, _)| resolved)
+}
+
+fn interface_scope_member(
+    db: &dyn HirDefDb,
+    interface: DefId,
+    modport: Option<&Ident>,
+    name: &Ident,
+    allow_alias: bool,
+) -> Option<Vec<(Resolution<DefId>, Option<[i32; 2]>)>> {
+    use crate::module::modport::ModportPortKind;
+    let scope = descend_scope(db, interface)?;
+    if let Some(modport) = modport {
+        let port = db
+            .scope(scope)
+            .lookup(NameContext::Value, modport)
+            .unique()?
+            .primary_origin(db)
+            .as_modport(db)?;
+        let data = port.cont_id.data(db);
+        let mut members = data.modports[port.value].ports.iter().filter(|port| port.name == *name);
+        let member = members.next()?;
+        if members.next().is_some() {
+            return None;
+        }
+        let (underlying, range) = match &member.kind {
+            ModportPortKind::Simple { .. } => (name, None),
+            ModportPortKind::Explicit { target, range, .. } if allow_alias => (target.as_ref()?, *range),
+            ModportPortKind::Concatenated { parts, .. } if allow_alias => {
+                return Some(parts.iter().map(|(name, range)| {
+                    (db.scope(scope).lookup(NameContext::Value, name), *range)
+                }).collect());
+            }
+            _ => return None,
+        };
+        return Some(vec![(db.scope(scope).lookup(NameContext::Value, underlying), range)]);
+    }
+    Some(vec![(db.scope(scope).lookup(NameContext::Value, name), None)])
 }
 
 /// Resolves a member of a struct, union or enum value.

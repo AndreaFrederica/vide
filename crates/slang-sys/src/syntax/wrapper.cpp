@@ -96,7 +96,7 @@ namespace slang_sys::syntax {
         source_manager.setDisableProximatePaths(true);
     }
 
-    void SourceSession::assign_source_buffer(std::string path, std::string text) {
+    void SourceSession::assign_source_buffer(std::string path, std::string text, std::string name) {
         if (path.empty())
             throw std::invalid_argument("source buffer path must not be empty");
 
@@ -106,7 +106,12 @@ namespace slang_sys::syntax {
                 throw std::logic_error("source buffer path was assigned conflicting text");
             return;
         }
-        auto source_buffer = source_manager.assignText(it->first, it->second);
+        const slang::SourceLibrary* library = nullptr;
+        if (!name.empty() && name != "work") {
+            library = &libraries.try_emplace(name, std::string(name),
+                                              static_cast<int>(libraries.size())).first->second;
+        }
+        auto source_buffer = source_manager.assignText(it->first, it->second, {}, library);
         if (!source_buffer)
             throw std::logic_error("Slang failed to assign source buffer");
         source_buffers.emplace(it->first, source_buffer);
@@ -311,6 +316,50 @@ namespace slang_sys::syntax::tree {
             buffer, session->source_manager, options);
         return wrap_syntax_tree(
             std::move(tree), session, "Slang failed to create syntax tree from buffer");
+    }
+
+    std::shared_ptr<SyntaxTree> parse_grouped_sources(
+        const std::shared_ptr<SourceSession>& session,
+        const rust::Vec<rust::String>& paths,
+        rust::Vec<rust::String> predefines,
+        rust::Vec<rust::String> include_paths
+    ) {
+        std::vector<slang::SourceBuffer> buffers;
+        buffers.reserve(paths.size());
+        for (const auto& path : paths)
+            buffers.push_back(session->source_buffer(std::string_view(path.data(), path.size())));
+        const auto options = make_syntax_options(
+            predefines, include_paths, true, false, 0, false);
+        auto tree = ::slang::syntax::SyntaxTree::fromBuffers(
+            buffers, session->source_manager, options);
+        return wrap_syntax_tree(std::move(tree), session, "Slang failed to parse compilation unit");
+    }
+
+    std::shared_ptr<SyntaxTree> project_source_file(const SyntaxTree& group, rust::Str path) {
+        using namespace ::slang::syntax;
+        auto& manager = group.session->source_manager;
+        const auto source = group.session->source_buffer(std::string_view(path.data(), path.size()));
+        slang::BumpAllocator alloc;
+        std::vector<MemberSyntax*> members;
+        for (auto* member : group.tree->root().as<CompilationUnitSyntax>().members) {
+            auto location = manager.getFullyExpandedLoc(member->sourceRange().start());
+            while (location.valid() && location.buffer() != source.id &&
+                   manager.isIncludedFileLoc(location))
+                location = manager.getFullyExpandedLoc(manager.getIncludedFrom(location.buffer()));
+            if (location.valid() && location.buffer() == source.id)
+                members.push_back(deepClone(*member, alloc));
+        }
+        auto eof = slang::parsing::Token(
+            alloc, slang::parsing::TokenKind::EndOfFile, {}, "",
+            slang::SourceLocation(source.id, source.data.size()));
+        auto& root = SyntaxFactory(alloc).compilationUnit(
+            SyntaxList<MemberSyntax>(alloc, std::span<MemberSyntax* const>(members)), eof);
+        auto tree = std::make_shared<::slang::syntax::SyntaxTree>(
+            &root, manager, std::move(alloc), nullptr);
+        auto projected = std::make_shared<slang_sys::syntax::SyntaxTree>(
+            std::move(tree), group.session, source.id.getId());
+        projected->source_owner = group.tree;
+        return projected;
     }
 
     const SyntaxNode *syntax_tree_root(const SyntaxTree &tree) {
@@ -894,7 +943,11 @@ namespace slang_sys::syntax::tree {
                         origin.kind = 4;
                         break;
                     case slang::parsing::MacroUsageOrigin::Unknown:
-                        throw std::logic_error("Slang macro argument has unknown macro origin");
+                        // An expansion can be known even when Slang cannot
+                        // attribute the macro definition to a source buffer.
+                        // Keep this token available to semantic analysis.
+                        origin.kind = 0;
+                        break;
                 }
                 origin.argument_token_range = original_range;
                 origin.body_token_range = trace_range(source_manager.getFullyOriginalRange(
@@ -928,7 +981,8 @@ namespace slang_sys::syntax::tree {
                         origin.kind = 4;
                         break;
                     case slang::parsing::MacroUsageOrigin::Unknown:
-                        throw std::logic_error("Slang macro body has unknown macro origin");
+                        origin.kind = 0;
+                        break;
                 }
                 origin.body_token_range = original_range;
                 origin.body_token_index = token_origin.bodyTokenIndex;

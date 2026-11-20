@@ -25,7 +25,7 @@ use crate::{
     db::workspace_symbol_index_db::WorkspaceSymbolIndexDb,
     definitions::{DefinitionClass, rightmost_name_token},
     module_resolution::resolve_hir_instantiation_target,
-    references::{ReferenceCategory, search::resolve_source_range},
+    references::{access, search::resolve_source_range},
     semantic_target::{
         SemanticTarget, TargetIntent, preproc::emit_token_index, resolve_plain_syntax_target,
         resolve_semantic_target_with_emitted,
@@ -762,15 +762,17 @@ fn collect_definition_token(
     let reference = SemanticReference {
         file_id,
         range,
-        category: ReferenceCategory::from_tok(token),
+        category: access::classify(db, file_id, definition, token, context),
         ptr: SyntaxTokenPtr::from_token(token),
         context: context.clone(),
     };
-    if !group
+    if let Some(existing) = group
         .references
-        .iter()
-        .any(|existing| existing.file_id == reference.file_id && existing.range == reference.range)
+        .iter_mut()
+        .find(|existing| existing.file_id == reference.file_id && existing.range == reference.range)
     {
+        existing.category |= reference.category;
+    } else {
         group.references.push(reference);
     }
 }

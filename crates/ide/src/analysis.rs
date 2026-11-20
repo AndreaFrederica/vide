@@ -19,6 +19,9 @@ use vfs::FileId;
 
 use crate::{
     Cancellable, FilePosition, RangeInfo,
+    assignment_trace::{
+        self, FileAssignmentTrace, FileSignalRelations, TraceBudget, TraceDirection,
+    },
     code_action::{self, CodeAction, CodeActionResolveStrategy},
     code_lens::{self, CodeLens, CodeLensConfig, CodeLensKind},
     completion::{CompletionItem, context::TriggerChar},
@@ -67,6 +70,60 @@ impl AnalysisSnapshot {
 
     pub fn file_text(&self, file_id: FileId) -> Cancellable<Arc<str>> {
         self.with_db(|db| db.file_text(file_id))
+    }
+
+    pub fn file_signal_relations(
+        &self,
+        position: FilePosition,
+    ) -> Cancellable<Option<FileSignalRelations>> {
+        self.with_db(|db| assignment_trace::file_signal_relations(db, position))
+    }
+
+    pub fn module_assignments(
+        &self,
+        file_id: FileId,
+        module: &str,
+        budget: TraceBudget,
+    ) -> Cancellable<Option<(Vec<assignment_trace::TraceSignal>, Vec<assignment_trace::AssignmentRelation>, bool)>> {
+        self.with_db(|db| assignment_trace::module_assignments(db, file_id, module, budget))
+    }
+
+    pub fn trace_file_assignments(
+        &self,
+        position: FilePosition,
+        direction: TraceDirection,
+        budget: TraceBudget,
+    ) -> Cancellable<Option<FileAssignmentTrace>> {
+        self.with_db(|db| {
+            assignment_trace::trace_file_assignments(db, position, direction, budget, None)
+        })
+    }
+
+    pub fn trace_interface_member(
+        &self,
+        position: FilePosition,
+        member: &str,
+        direction: TraceDirection,
+        budget: TraceBudget,
+    ) -> Cancellable<Option<FileAssignmentTrace>> {
+        self.with_db(|db| {
+            assignment_trace::trace_file_assignments(db, position, direction, budget, Some(member))
+        })
+    }
+
+    pub fn trace_bound_assignments(
+        &self,
+        position: FilePosition,
+        direction: TraceDirection,
+        budget: TraceBudget,
+        member: Option<(&str, Option<&str>)>,
+        interface_types: &[assignment_trace::GenericInterfaceSource],
+    ) -> Cancellable<Option<FileAssignmentTrace>> {
+        self.with_db(|db| {
+            assignment_trace::trace_bound_assignments(
+                db, position, direction, budget, member, interface_types,
+            )
+        })
     }
 
     pub fn file_ids(&self) -> Cancellable<Vec<FileId>> {
@@ -138,6 +195,14 @@ impl AnalysisSnapshot {
 
     pub fn compilation_plan(&self, file_id: FileId) -> Cancellable<Arc<CompilationPlan>> {
         self.with_db(|db| db.compilation_plan_for_root(db.source_root_id(file_id)))
+    }
+
+    pub fn trace_compilation_files(
+        &self,
+        file_id: FileId,
+        plan: &CompilationPlan,
+    ) -> Cancellable<(Vec<FileId>, bool)> {
+        self.with_db(|db| db.trace_compilation_files(file_id, plan))
     }
 }
 

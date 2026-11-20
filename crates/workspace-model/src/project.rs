@@ -81,9 +81,21 @@ pub struct CompilationProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExplicitCompilationInputs {
+    pub sources: Option<Vec<AbsPathBuf>>,
+    pub compilation_units: Option<Vec<Vec<AbsPathBuf>>>,
+    pub compilation_unit_options: Option<Vec<PreprocessConfig>>,
+    pub library_files: Vec<AbsPathBuf>,
+    pub library_maps: Vec<AbsPathBuf>,
+    pub source_libraries: Vec<(AbsPathBuf, String)>,
+    pub parameter_overrides: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProjectConfig {
     root_profiles: Vec<Option<CompilationProfileId>>,
     profiles: Vec<CompilationProfile>,
+    explicit_inputs: Vec<ExplicitCompilationInputs>,
 }
 
 impl ProjectConfig {
@@ -91,7 +103,19 @@ impl ProjectConfig {
         root_profiles: Vec<Option<CompilationProfileId>>,
         profiles: Vec<CompilationProfile>,
     ) -> Self {
-        Self { root_profiles, profiles }
+        Self { root_profiles, profiles, explicit_inputs: Vec::new() }
+    }
+
+    pub fn with_explicit_inputs(mut self, explicit_inputs: Vec<ExplicitCompilationInputs>) -> Self {
+        self.explicit_inputs = explicit_inputs;
+        self
+    }
+
+    pub fn explicit_inputs(
+        &self,
+        profile_id: Option<CompilationProfileId>,
+    ) -> Option<&ExplicitCompilationInputs> {
+        self.explicit_inputs.get(profile_id?.0 as usize)
     }
 
     pub fn profile_for_root(&self, root_id: SourceRootId) -> Option<CompilationProfileId> {

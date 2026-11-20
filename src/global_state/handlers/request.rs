@@ -8,6 +8,7 @@ mod navigation;
 mod rename;
 mod semantic_tokens;
 mod symbols;
+mod trace;
 
 pub(crate) use code_action::{handle_code_action, handle_code_action_resolve};
 pub(crate) use commands::handle_execute_command;
@@ -31,3 +32,4 @@ pub(crate) use semantic_tokens::{
 pub(crate) use symbols::{
     handle_document_symbol, handle_folding_ranges, handle_selection_range, handle_workspace_symbol,
 };
+pub(crate) use trace::{handle_trace_drivers, handle_trace_loads};

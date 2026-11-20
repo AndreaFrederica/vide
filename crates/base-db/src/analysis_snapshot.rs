@@ -40,6 +40,7 @@ pub struct CompilationContext {
     pub predefines: Arc<[String]>,
     pub library_maps: Arc<[FileId]>,
     pub top_modules: Arc<[String]>,
+    pub parameter_overrides: Arc<[String]>,
 }
 
 impl CompilationContext {
@@ -58,6 +59,7 @@ impl CompilationContext {
             predefines: predefines.into(),
             library_maps: library_maps.into(),
             top_modules: top_modules.into(),
+            parameter_overrides: Vec::new().into(),
         }
     }
 

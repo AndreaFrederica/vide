@@ -137,6 +137,9 @@ pub(crate) fn source_preproc_context_index_for_profile(
     let mut skipped_models = 0usize;
 
     for model_file_id in plan.roots.iter().copied() {
+        if plan.preprocessor_root(model_file_id) != model_file_id {
+            continue;
+        }
         if !matches!(
             db.file_kind(model_file_id),
             SourceFileKind::SystemVerilog | SourceFileKind::IncludeHeader

@@ -7,11 +7,13 @@ namespace slang_sys::compilation {
 
 namespace {
 
-::slang::Bag make_options(const std::vector<std::string>& top_modules) {
+::slang::Bag make_options(const std::vector<std::string>& top_modules,
+                          std::vector<std::string> parameter_overrides) {
     ::slang::Bag options;
     auto& compilation_options = options.insertOrGet<::slang::ast::CompilationOptions>();
     for (const auto& top_module : top_modules)
         compilation_options.topModules.emplace(top_module);
+    compilation_options.paramOverrides = std::move(parameter_overrides);
     return options;
 }
 
@@ -25,13 +27,15 @@ std::vector<std::string> to_std_strings(const rust::Vec<rust::String>& values) {
 
 } // namespace
 
-Compilation::Compilation(std::vector<std::string> top_modules) :
+Compilation::Compilation(std::vector<std::string> top_modules,
+                         std::vector<std::string> parameter_overrides) :
     top_modules(std::move(top_modules)),
     session(std::make_shared<syntax::SourceSession>()),
-    inner(std::make_unique<::slang::ast::Compilation>(make_options(this->top_modules))) {}
+    inner(std::make_unique<::slang::ast::Compilation>(make_options(this->top_modules, std::move(parameter_overrides)))) {}
 
-std::unique_ptr<Compilation> new_compilation(rust::Vec<rust::String> top_modules) {
-    return std::make_unique<Compilation>(to_std_strings(top_modules));
+std::unique_ptr<Compilation> new_compilation(rust::Vec<rust::String> top_modules,
+                                             rust::Vec<rust::String> parameter_overrides) {
+    return std::make_unique<Compilation>(to_std_strings(top_modules), to_std_strings(parameter_overrides));
 }
 
 std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_text(
@@ -63,15 +67,17 @@ std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_text(
 void register_source_buffers(
     Compilation& compilation,
     rust::Vec<rust::String> paths,
-    rust::Vec<rust::String> texts
+    rust::Vec<rust::String> texts,
+    rust::Vec<rust::String> libraries
 ) {
-    if (paths.size() != texts.size())
-        throw std::invalid_argument("source buffer paths and texts must have equal lengths");
+    if (paths.size() != texts.size() || paths.size() != libraries.size())
+        throw std::invalid_argument("source buffer paths, texts and libraries must have equal lengths");
 
     for (std::size_t i = 0; i < paths.size(); i++) {
         compilation.session->assign_source_buffer(
             std::string(paths[i].data(), paths[i].size()),
-            std::string(texts[i].data(), texts[i].size())
+            std::string(texts[i].data(), texts[i].size()),
+            std::string(libraries[i].data(), libraries[i].size())
         );
     }
 }
@@ -80,7 +86,8 @@ std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_buffer(
     Compilation& compilation,
     rust::Str name,
     rust::Str path,
-    ParseSyntaxTreeOptions options
+    ParseSyntaxTreeOptions options,
+    bool library_unit
 ) {
     if (!options.include_buffer_paths.empty() || !options.include_buffer_texts.empty())
         throw std::invalid_argument(
@@ -98,8 +105,25 @@ std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_buffer(
         options.expected_syntax_offset,
         options.has_expected_syntax_offset
     );
+    tree->tree->isLibraryUnit = library_unit;
     compilation.inner->addSyntaxTree(tree->tree);
     return tree;
+}
+
+std::shared_ptr<syntax::SyntaxTree> parse_grouped_sources(
+    Compilation& compilation,
+    rust::Vec<rust::String> paths,
+    rust::Vec<rust::String> predefines,
+    rust::Vec<rust::String> include_paths
+) {
+    return syntax::tree::parse_grouped_sources(
+        compilation.session, paths, std::move(predefines), std::move(include_paths));
+}
+
+std::shared_ptr<syntax::SyntaxTree> project_source_file(
+    const syntax::SyntaxTree& group, rust::Str path
+) {
+    return syntax::tree::project_source_file(group, path);
 }
 
 std::shared_ptr<syntax::SyntaxTree> parse_library_map_syntax_tree_from_text(

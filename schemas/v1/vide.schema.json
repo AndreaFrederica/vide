@@ -18,6 +18,14 @@
         ]
       ]
     },
+    "parameter_overrides": {
+      "description": "SystemVerilog parameter overrides. Use NAME=value for a top-level parameter or top.instance.NAME=value for an explicit hierarchy path.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
     "defines": {
       "description": "Predefined macros. Use NAME or NAME=value strings.",
       "type": "array",
@@ -45,6 +53,60 @@
           "ip/**/*.sv"
         ]
       ]
+    },
+    "source_files": {
+      "description": "Literal compilation inputs in simulator order, relative to this manifest\nor absolute.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "compilation_units": {
+      "description": "Ordered groups of files parsed together. The groups must partition\nsource_files.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "compilation_unit_options": {
+      "description": "Additional preprocessing options for each entry in compilation_units.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/TomlCompilationUnitOptions"
+      }
+    },
+    "library_files": {
+      "description": "Explicit Verilog source library files, each parsed in its own\ncompilation unit.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "library_maps": {
+      "description": "Library map files containing source mappings or SystemVerilog configs.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_libraries": {
+      "description": "Named Verilog libraries for specific compilation inputs.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TomlSourceLibrary"
+      }
     },
     "include_dirs": {
       "description": "Include search directories. When omitted and sources is set explicitly, Vide uses the scan roots inferred from sources. Explicit include_dirs = [] disables this fallback.",
@@ -91,6 +153,43 @@
   },
   "additionalProperties": false,
   "x-tombi-table-keys-order": "schema",
+  "$defs": {
+    "TomlCompilationUnitOptions": {
+      "type": "object",
+      "properties": {
+        "defines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "include_dirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "TomlSourceLibrary": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "name"
+      ]
+    }
+  },
   "x-vide-manifest-names": {
     "primary": "vide.toml"
   }

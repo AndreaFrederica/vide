@@ -19,9 +19,11 @@ pub struct ModportPort {
     pub kind: ModportPortKind,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ModportPortKind {
     Simple { dir: PortDirection },
+    Explicit { dir: PortDirection, target: Option<Ident>, range: Option<[i32; 2]> },
+    Concatenated { dir: PortDirection, parts: Vec<(Ident, Option<[i32; 2]>)> },
     Subroutine { dir: PortDirection },
     Clocking,
 }
@@ -64,7 +66,16 @@ impl LowerModuleCtx<'_> {
                     let dir = lower_modport_dir(port_list.direction()).unwrap_or_default();
                     for port in port_list.ports().children() {
                         if let Some(name) = lower_modport_port_name(port) {
-                            ports.push(ModportPort { name, kind: ModportPortKind::Simple { dir } });
+                            let kind = match port {
+                                ast::ModportPort::ModportNamedPort(_) => {
+                                    ModportPortKind::Simple { dir }
+                                }
+                                ast::ModportPort::ModportExplicitPort(port) => {
+                                    lower_explicit_port(dir, port.expr())
+                                }
+                                ast::ModportPort::ModportSubroutinePort(_) => continue,
+                            };
+                            ports.push(ModportPort { name, kind });
                         }
                     }
                 }
@@ -100,6 +111,88 @@ impl LowerModuleCtx<'_> {
 
         ports
     }
+}
+
+fn lower_explicit_port(dir: PortDirection, expression: Option<ast::Expression<'_>>) -> ModportPortKind {
+    use ast::{Expression, PrimaryExpression};
+    if let Some(expression @ Expression::PrimaryExpression(PrimaryExpression::ConcatenationExpression(_))) = expression {
+        let mut parts = Vec::new();
+        if collect_concat(expression, &mut parts, 0).is_some() && parts.len() >= 2 {
+            return ModportPortKind::Concatenated { dir, parts };
+        }
+    }
+    match expression.and_then(operand) {
+        Some((target, range)) => ModportPortKind::Explicit { dir, target: Some(target), range },
+        None => ModportPortKind::Explicit { dir, target: None, range: None },
+    }
+}
+
+fn collect_concat(
+    expression: ast::Expression<'_>,
+    parts: &mut Vec<(Ident, Option<[i32; 2]>)>,
+    depth: usize,
+) -> Option<()> {
+    use ast::{Expression, PrimaryExpression};
+    if depth >= 32 || parts.len() >= 64 {
+        return None;
+    }
+    if let Expression::PrimaryExpression(PrimaryExpression::ConcatenationExpression(concat)) =
+        expression
+    {
+        for child in concat.expressions().children() {
+            collect_concat(child, parts, depth + 1)?;
+        }
+    } else {
+        parts.push(operand(expression)?);
+    }
+    Some(())
+}
+
+fn operand(expression: ast::Expression<'_>) -> Option<(Ident, Option<[i32; 2]>)> {
+    match expression {
+        ast::Expression::Name(ast::Name::IdentifierName(name)) => {
+            Some((lower_ident_opt(name.identifier())?, None))
+        }
+        ast::Expression::Name(ast::Name::IdentifierSelectName(name)) => {
+            Some((lower_ident_opt(name.identifier())?, Some(fixed_selection(name)?)))
+        }
+        _ => None,
+    }
+}
+
+fn fixed_selection(name: ast::IdentifierSelectName<'_>) -> Option<[i32; 2]> {
+    let mut selectors = name.selectors().children();
+    let selection = selectors.next()?.selector()?;
+    if selectors.next().is_some() {
+        return None;
+    }
+    let range = match selection {
+        ast::Selector::BitSelect(bit) => [decimal_index(bit.expr())?; 2],
+        ast::Selector::RangeSelect(range @ ast::RangeSelect::SimpleRangeSelect(_)) => {
+            [decimal_index(range.left())?, decimal_index(range.right())?]
+        }
+        _ => return None,
+    };
+    Some(range)
+}
+
+fn decimal_index(expression: ast::Expression<'_>) -> Option<i32> {
+    let (expression, sign) = match expression {
+        ast::Expression::PrefixUnaryExpression(unary) => match unary.operator_token()?.kind() {
+            TokenKind::PLUS => (unary.operand(), 1),
+            TokenKind::MINUS => (unary.operand(), -1),
+            _ => return None,
+        },
+        _ => (expression, 1),
+    };
+    let ast::Expression::PrimaryExpression(ast::PrimaryExpression::LiteralExpression(literal))
+        = expression else { return None; };
+    let token = literal.literal()?;
+    if token.kind() != TokenKind::INTEGER_LITERAL {
+        return None;
+    }
+    let value = i64::try_from(token.int()?.get_single_word()?).ok()?;
+    i32::try_from(value * sign).ok()
 }
 
 fn lower_modport_port_name(port: ast::ModportPort<'_>) -> Option<Ident> {

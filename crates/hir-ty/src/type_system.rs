@@ -2,10 +2,14 @@ use hir_def::{
     Ident,
     container::OwnerRef,
     def_id::DefId,
-    expr::{ExprId, data_ty::TypePathRecovery},
+    expr::{
+        ExprId,
+        data_ty::{BuiltinDataTy, Dimension, TypePathRecovery},
+    },
+    module::ModuleKind,
     owner::OwnerId,
     subroutine::SubroutineKind,
-    symbol::Resolution,
+    symbol::{DefOriginLoc, Resolution},
     typedef::TypedefId,
 };
 use syntax::SyntaxKind;
@@ -17,7 +21,7 @@ use crate::{
     display::{HirDisplay, HirDisplayError},
     infer::normalize_data_ty,
     members::members_of_ty,
-    ty::{Ty, TyResult},
+    ty::{BuiltinTy, Ty, TyResult},
 };
 
 /// A diagnostic produced while determining a semantic type.
@@ -108,6 +112,81 @@ impl<'db> TypeSystem<'db> {
 
     pub fn type_of_def(&self, def: DefId) -> Type {
         self.type_of_resolution(Resolution::Unique(def))
+    }
+
+    pub fn packed_signedness_of_def(&self, def: DefId) -> Option<bool> {
+        let declaration = def.declaration_origin(self.db).as_decl(self.db)?;
+        let data = declaration.cont_id.data(self.db);
+        if !data.declarator(declaration.value).dimensions.is_empty() {
+            return None;
+        }
+        let inferred = self.type_of_def(def);
+        let mut ty = inferred.ty();
+        while let Ty::Alias { target, .. } = ty {
+            ty = target;
+        }
+        match ty {
+            Ty::Builtin(BuiltinTy::Data { id, .. }) => match id.get() {
+                BuiltinDataTy::Int { signing, .. } => Some(*signing),
+                BuiltinDataTy::Vector { signing, dimensions, .. } if dimensions.len() <= 1 => {
+                    Some(*signing)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn package_packed_struct(&self, def: DefId) -> Option<DefId> {
+        let declaration = def.declaration_origin(self.db).as_decl(self.db)?;
+        if !declaration.cont_id.data(self.db).declarator(declaration.value).dimensions.is_empty() {
+            return None;
+        }
+        let inferred = self.type_of_def(def);
+        let mut ty = inferred.ty();
+        let mut alias = None;
+        while let Ty::Alias { typedef, target } = ty {
+            alias = Some(*typedef);
+            ty = target;
+        }
+        let Ty::Struct(structure) = ty else { return None };
+        let typedef = alias?;
+        if typedef.cont_id != structure.cont_id ||
+            typedef.cont_id.module_kind(self.db) != Some(ModuleKind::Package) ||
+            !structure.cont_id.data(self.db).struct_def(structure.value).packed
+        {
+            return None;
+        }
+        Some(DefId::from_source(self.db, DefOriginLoc::Typedef(typedef)))
+    }
+
+    /// For a single word index, indicate whether it leaves a packed vector.
+    pub fn word_index_leaves_packed_vector(&self, def: DefId) -> Option<bool> {
+        let declaration = def.declaration_origin(self.db).as_decl(self.db)?;
+        let data = declaration.cont_id.data(self.db);
+        let unpacked = match data.declarator(declaration.value).dimensions.as_slice() {
+            [Some(Dimension::Range(_, _) | Dimension::Size(_))] => true,
+            [] => false,
+            _ => return None,
+        };
+        let inferred = self.type_of_def(def);
+        let mut ty = inferred.ty();
+        while let Ty::Alias { target, .. } = ty {
+            ty = target;
+        }
+        let packed_dimensions = match ty {
+            Ty::Builtin(BuiltinTy::Data { id, .. }) => match id.get() {
+                BuiltinDataTy::Int { .. } => 1,
+                BuiltinDataTy::Vector { dimensions, .. } => dimensions.len(),
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if unpacked {
+            Some(packed_dimensions == 1)
+        } else {
+            (packed_dimensions == 2).then_some(true)
+        }
     }
 
     pub fn type_of_subroutine_return(&self, subroutine: OwnerId) -> Type {

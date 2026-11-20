@@ -137,6 +137,12 @@ fn insert_proc_bodies(scope: &mut ScopeData, db: &dyn HirDefDb, procs: &Arena<cr
     }
 }
 
+fn insert_dpi_imports(scope: &mut ScopeData, db: &dyn HirDefDb, owner: OwnerId, body: &Body) {
+    for (id, import) in body.dpi_imports.iter() {
+        scope.insert_value_opt(&import.method.name, def_id(db, OwnerRef::new(owner, id)));
+    }
+}
+
 impl ScopeData {
     pub fn non_ansi_port_decl_id_by_name(
         &self,
@@ -205,6 +211,7 @@ pub(crate) fn build_file_scope(db: &dyn HirDefDb, file_id: HirFileId) -> ScopeDa
     insert_body_declarators(&mut scope, db, file_owner, body.data_ref(), file_owner);
     insert_body_typedefs(&mut scope, db, file_owner, body.data_ref(), file_owner);
     insert_enum_members(&mut scope, db, file_owner);
+    insert_dpi_imports(&mut scope, db, file_owner, body.data_ref());
     insert_proc_bodies(&mut scope, db, &hir_file.procs);
 
     for subroutine_owner in hir_file.subroutine_owners() {
@@ -262,6 +269,7 @@ pub(crate) fn build_module_scope(db: &dyn HirDefDb, owner: OwnerId) -> ScopeData
         scope.insert_package_import(import);
     }
     insert_enum_members(&mut scope, db, owner);
+    insert_dpi_imports(&mut scope, db, owner, body.data_ref());
     for subroutine_owner in module.subroutine_owners() {
         let subroutine = db.subroutine(subroutine_owner);
         scope.insert_value_opt(&subroutine.name, owner_def_id(db, subroutine_owner));
@@ -398,6 +406,7 @@ pub(crate) fn build_generate_block_scope(db: &dyn HirDefDb, owner: OwnerId) -> S
         let subroutine = db.subroutine(subroutine_owner);
         scope.insert_value_opt(&subroutine.name, owner_def_id(db, subroutine_owner));
     }
+    insert_dpi_imports(&mut scope, db, owner, body.data_ref());
     insert_body_declarators(&mut scope, db, owner, body.data_ref(), owner);
     insert_body_typedefs(&mut scope, db, owner, body.data_ref(), owner);
     insert_enum_members(&mut scope, db, owner);
@@ -2023,6 +2032,8 @@ endpackage
             port_decls.values().any(|decl| decl.header
                 == crate::module::port::PortHeader::Interface {
                     dir: crate::module::port::PortDirection::default(),
+                    interface: None,
+                    modport: Some(ident("ifc")),
                 }),
             "interface port must keep its own header instead of the previous one"
         );

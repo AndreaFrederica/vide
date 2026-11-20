@@ -21,11 +21,15 @@ impl Default for Compilation {
 
 impl Compilation {
     pub fn new() -> Self {
-        Self { raw: ffi::new_compilation(Vec::new()) }
+        Self::new_with_options(&[], &[])
     }
 
     pub fn new_with_top_modules(top_modules: &[String]) -> Self {
-        Self { raw: ffi::new_compilation(top_modules.to_vec()) }
+        Self::new_with_options(top_modules, &[])
+    }
+
+    pub fn new_with_options(top_modules: &[String], parameter_overrides: &[String]) -> Self {
+        Self { raw: ffi::new_compilation(top_modules.to_vec(), parameter_overrides.to_vec()) }
     }
 
     pub fn add_syntax_tree(&mut self, tree: &SyntaxTree) {
@@ -33,10 +37,19 @@ impl Compilation {
     }
 
     pub fn register_source_buffers(&mut self, buffers: &[SyntaxTreeBuffer]) {
+        self.register_source_buffers_with_libraries(buffers, |_| String::new());
+    }
+
+    pub fn register_source_buffers_with_libraries(
+        &mut self,
+        buffers: &[SyntaxTreeBuffer],
+        library_for: impl Fn(&str) -> String,
+    ) {
         ffi::register_source_buffers(
             self.raw_pin(),
             buffers.iter().map(|buffer| buffer.path.clone()).collect(),
             buffers.iter().map(|buffer| buffer.text.clone()).collect(),
+            buffers.iter().map(|buffer| library_for(&buffer.path)).collect(),
         );
     }
 
@@ -62,6 +75,7 @@ impl Compilation {
         name: &str,
         path: &str,
         options: &SyntaxTreeOptions,
+        library_unit: bool,
     ) -> SyntaxTree {
         if !options.include_buffers.is_empty() {
             panic!("buffer parsing requires source buffers to be registered on the compilation");
@@ -72,7 +86,25 @@ impl Compilation {
             name,
             path,
             raw_options,
+            library_unit,
         ))
+    }
+
+    pub fn parse_grouped_sources(
+        &mut self,
+        paths: Vec<String>,
+        options: &SyntaxTreeOptions,
+    ) -> SyntaxTree {
+        SyntaxTree::from_raw(ffi::parse_grouped_sources(
+            self.raw_pin(),
+            paths,
+            options.predefines.clone(),
+            options.include_paths.clone(),
+        ))
+    }
+
+    pub fn project_source_file(group: &SyntaxTree, path: &str) -> SyntaxTree {
+        SyntaxTree::from_raw(ffi::project_source_file(group.raw.as_ref().unwrap(), path))
     }
 
     pub fn parse_library_map_syntax_tree_from_text(
@@ -200,6 +232,204 @@ mod tests {
     }
 
     #[test]
+    fn top_parameter_overrides_select_the_elaborated_branch() {
+        let tree = SyntaxTree::from_file_in_memory(
+            "module top #(parameter bit Mode = 0); if (Mode) begin $error(\"override branch\"); end endmodule",
+            "top",
+            "top.sv",
+        );
+        let top = ["top".to_owned()];
+        let mut default = Compilation::new_with_options(&top, &[]);
+        default.add_syntax_tree(&tree);
+        let has_marker = |diagnostics: &[SyntaxDiagnostic]| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("override branch")
+                    || diagnostic.args.iter().any(|arg| arg.contains("override branch"))
+            })
+        };
+        assert!(!has_marker(&default.semantic_diagnostics_with_options(&[])));
+
+        let mut overridden = Compilation::new_with_options(&top, &["Mode=1".to_owned()]);
+        overridden.add_syntax_tree(&tree);
+        let diagnostics = overridden.semantic_diagnostics_with_options(&[]);
+        assert!(has_marker(&diagnostics), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn qualified_overrides_select_only_the_named_top_and_instance() {
+        let tree = SyntaxTree::from_file_in_memory(
+            r#"
+module child #(parameter bit Mode = 0);
+    if (Mode) begin : selected $error("selected child"); end
+    else begin : unchanged $error("default child"); end
+endmodule
+module top_a #(parameter bit Mode = 0);
+    if (Mode) begin : selected $error("selected top_a"); end
+    child dut();
+    child sibling();
+endmodule
+module top_b #(parameter bit Mode = 0);
+    if (Mode) begin : selected $error("selected top_b"); end
+endmodule
+"#,
+            "scoped",
+            "scoped.sv",
+        );
+        let tops = ["top_a".to_owned(), "top_b".to_owned()];
+        let overrides = ["top_a.Mode=1".to_owned(), "top_a.dut.Mode=1".to_owned()];
+        let mut compilation = Compilation::new_with_options(&tops, &overrides);
+        compilation.add_syntax_tree(&tree);
+        let diagnostics = compilation.semantic_diagnostics_with_options(&[]);
+        let marked = |marker: &str| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains(marker)
+                    || diagnostic.args.iter().any(|arg| arg.contains(marker))
+            })
+        };
+        assert!(
+            marked("selected top_a")
+                && !marked("selected top_b")
+                && marked("selected child")
+                && marked("default child"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn indexed_overrides_elaborate_instance_arrays_and_negative_generate_indices() {
+        let tree = SyntaxTree::from_file_in_memory(
+            r#"
+module child #(parameter int Mode = 0);
+    if (Mode == 1) begin : array_override $error("array element selected"); end
+    if (Mode == 2) begin : generate_override $error("generate element selected"); end
+    if (Mode == 0) begin : unchanged $error("default element retained"); end
+endmodule
+module top;
+    child bank[1:0]();
+    for (genvar i = -1; i < 1; i++) begin : lanes
+        child dut();
+    end
+endmodule
+"#,
+            "indexed",
+            "indexed.sv",
+        );
+        let overrides = ["top.bank[1].Mode=1".to_owned(), "top.lanes[-1].dut.Mode=2".to_owned()];
+        let mut compilation = Compilation::new_with_options(&["top".to_owned()], &overrides);
+        compilation.add_syntax_tree(&tree);
+        let diagnostics = compilation.semantic_diagnostics_with_options(&[]);
+        for marker in
+            ["array element selected", "generate element selected", "default element retained"]
+        {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.message.contains(marker)),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn library_units_resolve_used_modules_without_instantiating_unused_tops() {
+        let unresolved_markers = |library_unit| {
+            let mut compilation = Compilation::new();
+            compilation.register_source_buffers(&[
+                SyntaxTreeBuffer {
+                    path: "top.sv".to_owned(),
+                    text: "module top; from_library u(); endmodule\n".to_owned(),
+                },
+                SyntaxTreeBuffer {
+                    path: "library.sv".to_owned(),
+                    text: "module from_library; endmodule\nmodule unused; unresolved_cell u(); endmodule\n"
+                        .to_owned(),
+                },
+            ]);
+            for (path, library) in [("top.sv", false), ("library.sv", library_unit)] {
+                compilation.parse_syntax_tree_from_buffer(
+                    path,
+                    path,
+                    &SyntaxTreeOptions::default(),
+                    library,
+                );
+            }
+            compilation.semantic_diagnostics_with_options(&[])
+        };
+        assert!(unresolved_markers(true).is_empty());
+        let diagnostics = unresolved_markers(false);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("unresolved_cell")
+                || diagnostic.args.iter().any(|arg| arg.contains("unresolved_cell"))
+        }));
+    }
+
+    #[test]
+    fn named_source_libraries_keep_duplicate_modules_separate() {
+        let mut compilation = Compilation::new_with_top_modules(&["chosen:config".to_owned()]);
+        let files = [
+            ("top.sv", "module top; first a(); second b(); endmodule\n"),
+            (
+                "config.sv",
+                "config chosen; design work.top; default liblist work a b; instance top.a.u use a.cell_type; instance top.b.u use b.cell_type; endconfig\n",
+            ),
+            ("a/wrapper.sv", "module first; cell_type #(.Expected(1)) u(); endmodule\n"),
+            ("b/wrapper.sv", "module second; cell_type #(.Expected(0)) u(); endmodule\n"),
+            (
+                "a/cell.sv",
+                "module cell_type #(parameter bit Expected = 0); if (!Expected) begin : wrong $error(\"wrong first library\"); end endmodule\n",
+            ),
+            (
+                "b/cell.sv",
+                "module cell_type #(parameter bit Expected = 1); if (Expected) begin : wrong $error(\"wrong second library\"); end endmodule\n",
+            ),
+        ];
+        let buffers = files
+            .map(|(path, text)| SyntaxTreeBuffer { path: path.to_owned(), text: text.to_owned() });
+        compilation.register_source_buffers_with_libraries(&buffers, |file| {
+            file.split_once('/').map_or("work", |(library, _)| library).to_owned()
+        });
+        for (file, _) in files {
+            compilation.parse_syntax_tree_from_buffer(
+                file,
+                file,
+                &SyntaxTreeOptions::default(),
+                false,
+            );
+        }
+        let diagnostics = compilation.semantic_diagnostics_with_options(&[]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn grouped_files_share_macros_and_declarations_while_projections_keep_their_own_source() {
+        let mut compilation = Compilation::new_with_top_modules(&["top".to_owned()]);
+        compilation.register_source_buffers(&[
+            SyntaxTreeBuffer {
+                path: "defs.sv".to_owned(),
+                text: "`define VALUE 1'b1\ntypedef logic word_t;\n".to_owned(),
+            },
+            SyntaxTreeBuffer {
+                path: "top.sv".to_owned(),
+                text: "module top; word_t q = `VALUE; endmodule\n".to_owned(),
+            },
+            SyntaxTreeBuffer {
+                path: "isolated.sv".to_owned(),
+                text: "`ifdef VALUE\ninvalid source;\n`endif\nmodule isolated; endmodule\n"
+                    .to_owned(),
+            },
+        ]);
+        let options = SyntaxTreeOptions::default();
+        let group = compilation
+            .parse_grouped_sources(vec!["defs.sv".to_owned(), "top.sv".to_owned()], &options);
+        let defs = Compilation::project_source_file(&group, "defs.sv");
+        let top = Compilation::project_source_file(&group, "top.sv");
+        assert_eq!(group.buffer_id(), defs.buffer_id());
+        assert_ne!(top.buffer_id(), defs.buffer_id());
+        compilation.add_syntax_tree(&group);
+        compilation.parse_syntax_tree_from_buffer("isolated", "isolated.sv", &options, false);
+        assert!(compilation.parse_diagnostics_with_options(&[]).is_empty());
+        assert!(compilation.semantic_diagnostics_with_options(&[]).is_empty());
+    }
+
+    #[test]
     fn registered_source_buffers_are_available_before_root_parsing() {
         let mut compilation = Compilation::new();
         compilation.register_source_buffers(&[
@@ -218,6 +448,7 @@ mod tests {
             "root",
             "root.sv",
             &SyntaxTreeOptions::default(),
+            false,
         );
 
         assert_eq!(tree.root().kind(), SyntaxKind::COMPILATION_UNIT);

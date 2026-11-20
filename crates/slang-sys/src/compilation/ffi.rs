@@ -44,7 +44,10 @@ mod slang_ffi {
 
         type Compilation;
 
-        fn new_compilation(top_modules: Vec<String>) -> UniquePtr<Compilation>;
+        fn new_compilation(
+            top_modules: Vec<String>,
+            parameter_overrides: Vec<String>,
+        ) -> UniquePtr<Compilation>;
         fn parse_syntax_tree_from_text(
             compilation: Pin<&mut Compilation>,
             text: &str,
@@ -56,13 +59,22 @@ mod slang_ffi {
             compilation: Pin<&mut Compilation>,
             paths: Vec<String>,
             texts: Vec<String>,
+            libraries: Vec<String>,
         );
         fn parse_syntax_tree_from_buffer(
             compilation: Pin<&mut Compilation>,
             name: &str,
             path: &str,
             options: ParseSyntaxTreeOptions,
+            library_unit: bool,
         ) -> SharedPtr<SyntaxTree>;
+        fn parse_grouped_sources(
+            compilation: Pin<&mut Compilation>,
+            paths: Vec<String>,
+            predefines: Vec<String>,
+            include_paths: Vec<String>,
+        ) -> SharedPtr<SyntaxTree>;
+        fn project_source_file(group: &SyntaxTree, path: &str) -> SharedPtr<SyntaxTree>;
         fn parse_library_map_syntax_tree_from_text(
             compilation: Pin<&mut Compilation>,
             text: &str,

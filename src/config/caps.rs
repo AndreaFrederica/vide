@@ -393,7 +393,12 @@ impl Config {
                 workspace_diagnostics: true,
                 work_done_progress_options: Default::default(),
             })),
-            experimental: None,
+            experimental: Some(serde_json::json!({
+                "videTrace": {
+                    "schemaVersion": crate::lsp_ext::trace::TRACE_VERSION,
+                    "orderedProjectSources": true
+                }
+            })),
         }
     }
 }

@@ -19,6 +19,7 @@ use crate::{
     },
 };
 
+pub(crate) mod access;
 mod preproc;
 pub(crate) mod search;
 
@@ -27,13 +28,6 @@ bitflags::bitflags! {
     pub struct ReferenceCategory: u8 {
         const WRITE = 1 << 0;
         const READ = 1 << 1;
-    }
-}
-
-impl ReferenceCategory {
-    pub fn from_tok(SyntaxTokenWithParent { .. }: SyntaxTokenWithParent) -> ReferenceCategory {
-        // TODO:
-        ReferenceCategory::empty()
     }
 }
 

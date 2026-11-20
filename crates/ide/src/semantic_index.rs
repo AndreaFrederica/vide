@@ -852,3 +852,108 @@ endmodule
         }));
     }
 }
+
+#[cfg(test)]
+mod reference_access_tests {
+    use super::{FileSemanticIndex, ReferenceCategory as Access};
+    use crate::test_utils::setup_marked_with_path;
+
+    fn check(source: &str, expected: &[(&str, Option<Access>)]) {
+        let (host, file, _, markers) = setup_marked_with_path(source, "/access.sv");
+        let index = FileSemanticIndex::for_file(host.raw_db(), file);
+        for &(marker, expected_access) in expected {
+            let offset = markers[marker];
+            let categories = index
+                .groups
+                .values()
+                .flat_map(|group| &group.references)
+                .filter(|reference| reference.range.contains(offset))
+                .map(|reference| reference.category)
+                .reduce(|left, right| left | right);
+            assert_eq!(categories, expected_access, "{marker}");
+        }
+    }
+
+    #[test]
+    fn assignment_targets_selectors_and_conditions() {
+        check(
+            r#"
+module source(input logic clk, input logic [1:0] index, input logic [3:0] x);
+    logic [3:0] a, b, c;
+    typedef struct packed { logic valid; } item_t;
+    item_t item;
+    assign /*marker:continuous*/c = /*marker:source*/x;
+    always @(posedge /*marker:clock*/clk) begin
+        if (/*marker:condition*/a <= b)
+            {/*marker:concat*/a[/*marker:index*/index], b[0]} <= /*marker:nba_value*/x[1:0];
+        /*marker:compound*/a += /*marker:compound_value*/b;
+        /*marker:increment*/b++;
+        /*marker:blocking*/a = b;
+        item./*marker:field*/valid = /*marker:field_value*/x[0];
+        a = /*marker:unresolved*/not_declared;
+    end
+endmodule
+"#,
+            &[
+                ("continuous", Some(Access::WRITE)),
+                ("source", Some(Access::READ)),
+                ("clock", Some(Access::READ)),
+                ("condition", Some(Access::READ)),
+                ("concat", Some(Access::WRITE)),
+                ("index", Some(Access::READ)),
+                ("nba_value", Some(Access::READ)),
+                ("compound", Some(Access::READ | Access::WRITE)),
+                ("compound_value", Some(Access::READ)),
+                ("increment", Some(Access::READ | Access::WRITE)),
+                ("blocking", Some(Access::WRITE)),
+                ("field", Some(Access::WRITE)),
+                ("field_value", Some(Access::READ)),
+                ("unresolved", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn port_direction_applies_to_the_local_expression() {
+        check(
+            r#"
+module child(input logic i, output logic o, inout wire io, ref logic r);
+endmodule
+module top;
+    logic x, y, z, r;
+    wire w;
+    /*marker:module*/child named(
+        ./*marker:label*/i(/*marker:input*/x),
+        .o(/*marker:output*/y),
+        .io(/*marker:inout*/w),
+        ./*marker:shorthand*/r
+    );
+    child ordered(x, /*marker:ordered*/z, w, r);
+endmodule
+"#,
+            &[
+                ("module", Some(Access::empty())),
+                ("label", Some(Access::empty())),
+                ("input", Some(Access::READ)),
+                ("output", Some(Access::WRITE)),
+                ("inout", Some(Access::READ | Access::WRITE)),
+                ("shorthand", Some(Access::READ | Access::WRITE)),
+                ("ordered", Some(Access::WRITE)),
+            ],
+        );
+    }
+
+    #[test]
+    fn macro_argument_preserves_read_and_write_at_the_source_range() {
+        check(
+            r#"
+`define BUMP(signal) signal = signal + 1
+module top;
+    logic [3:0] count;
+    initial `BUMP(/*marker:argument*/count);
+endmodule
+"#,
+            &[("argument", Some(Access::READ | Access::WRITE))],
+        );
+    }
+}

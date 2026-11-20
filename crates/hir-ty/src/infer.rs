@@ -144,6 +144,7 @@ pub(crate) fn type_of_def_id(db: &dyn TyDb, def_id: DefId) -> TyResult {
                 | DefKind::Block
                 | DefKind::GenerateBlock
                 | DefKind::Subroutine
+                | DefKind::DpiImport
                 | DefKind::SubroutinePort
                 | DefKind::NonAnsiPort
                 | DefKind::Typedef
@@ -203,6 +204,7 @@ pub(crate) fn type_of_def_id(db: &dyn TyDb, def_id: DefId) -> TyResult {
         | DefKind::Config
         | DefKind::Library
         | DefKind::Subroutine
+        | DefKind::DpiImport
         | DefKind::NonAnsiPort
         | DefKind::ClockingBlock
         | DefKind::ClockingSignal
@@ -251,6 +253,7 @@ fn type_of_non_ansi_port(db: &dyn TyDb, def_id: DefId) -> TyResult {
             | DefKind::Block
             | DefKind::GenerateBlock
             | DefKind::Subroutine
+            | DefKind::DpiImport
             | DefKind::SubroutinePort
             | DefKind::NonAnsiPort
             | DefKind::Typedef

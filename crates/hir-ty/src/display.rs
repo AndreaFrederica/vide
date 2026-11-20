@@ -385,14 +385,19 @@ impl HirDisplay for OwnerRef<PortHeader> {
                 }
                 OwnerRef::new(*cont_id, ty.clone()).hir_fmt(f)
             }
-            PortHeader::Interface { dir } => {
+            PortHeader::Interface { dir, interface, modport } => {
                 match dir {
                     PortDirection::Input => f.write_str("input ")?,
                     PortDirection::Output => f.write_str("output ")?,
                     PortDirection::Inout => f.write_str("inout ")?,
                     PortDirection::Ref => f.write_str("ref ")?,
                 }
-                f.write_str("interface")
+                f.write_str(interface.as_deref().unwrap_or("interface"))?;
+                if let Some(modport) = modport {
+                    f.write_str(".")?;
+                    f.write_str(modport)?;
+                }
+                Ok(())
             }
         }
     }

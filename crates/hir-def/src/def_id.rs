@@ -129,6 +129,9 @@ impl DefOriginLoc {
             DefOriginLoc::Block(owner) => owner.name(db),
             DefOriginLoc::GenerateBlock(owner) => db.body(owner).name.clone(),
             DefOriginLoc::Subroutine(owner) => db.subroutine(owner).name.clone(),
+            DefOriginLoc::DpiImport(import) => {
+                db.body(import.cont_id).get(import.value).method.name.clone()
+            }
             DefOriginLoc::SubroutinePort(OwnerRef { cont_id: subroutine, value }) => {
                 db.subroutine(subroutine).ports.get(value.0 as usize)?.name.clone()
             }
@@ -213,6 +216,7 @@ impl DefOriginLoc {
                 Some(InFile::new(owner.file(db), owner.ast_id(db)))
             }
             DefOriginLoc::Subroutine(owner) => Some(InFile::new(owner.file(db), owner.ast_id(db))),
+            DefOriginLoc::DpiImport(import) => owner_source(db, import.cont_id, import.value),
             DefOriginLoc::SubroutinePort(OwnerRef { cont_id: subroutine, value }) => {
                 let source = db.subroutine(subroutine).ports.get(value.0 as usize)?.source;
                 Some(InFile::new(subroutine.file(db), source))
@@ -479,6 +483,10 @@ pub(crate) fn definition_table(db: &dyn HirDefDb, owner: OwnerId) -> Arc<Definit
         OwnerKind::File | OwnerKind::ProceduralBlock => {}
     }
 
+    for (id, source) in sources.dpi_import_srcs.iter() {
+        table.insert(db, source, DefOriginLoc::DpiImport(OwnerRef::new(owner, id)));
+    }
+
     // Aggregate members are definitions too: enum literals and struct fields need
     // stable identities so navigation and hover can target their source names.
     for (enum_id, enum_def) in body.enums.iter() {
@@ -722,6 +730,25 @@ impl DefId {
         }
     }
 
+    pub fn interface_port(
+        &self,
+        db: &dyn HirDefDb,
+    ) -> Option<(OwnerId, Option<crate::Ident>, Option<crate::Ident>)> {
+        let DefOriginLoc::Decl(decl) = self.declaration_origin(db).loc(db) else {
+            return None;
+        };
+        let body = decl.cont_id.data(db);
+        let DeclaratorParent::PortDeclId(port) = body.declarator(decl.value).parent else {
+            return None;
+        };
+        let crate::module::port::PortHeader::Interface { interface, modport, .. } =
+            &body.ports.get(port).header
+        else {
+            return None;
+        };
+        Some((decl.cont_id, interface.clone(), modport.clone()))
+    }
+
     /// Lowered data type of a declaration-backed definition.
     pub fn data_type(&self, db: &dyn HirDefDb) -> Option<DataTy> {
         match self.declaration_origin(db).loc(db) {
@@ -781,6 +808,7 @@ impl DefId {
                 SubroutineKind::Task => Some("Task"),
                 SubroutineKind::Function { .. } => Some("Function"),
             },
+            DefOriginLoc::DpiImport(_) => Some("DPI import"),
             DefOriginLoc::SubroutinePort(_) | DefOriginLoc::NonAnsiPort(_) => Some("Port"),
             DefOriginLoc::Decl(decl) => {
                 let container = decl.cont_id.data(db);
@@ -829,6 +857,7 @@ fn definition_owner(db: &dyn HirDefDb, loc: &DefOriginLoc) -> OwnerId {
         | DefOriginLoc::Library(InFile { file_id, .. })
         | DefOriginLoc::Udp(InFile { file_id, .. }) => file_owner(db, *file_id),
         DefOriginLoc::SubroutinePort(port) => port.cont_id,
+        DefOriginLoc::DpiImport(import) => import.cont_id,
         DefOriginLoc::NonAnsiPort(port) => port.cont_id,
         DefOriginLoc::Decl(decl) => decl.cont_id,
         DefOriginLoc::Typedef(typedef) => typedef.cont_id,

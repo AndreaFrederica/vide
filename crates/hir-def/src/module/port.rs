@@ -70,6 +70,8 @@ pub enum PortHeader {
     /// interface header.
     Interface {
         dir: PortDirection,
+        interface: Option<Ident>,
+        modport: Option<Ident>,
     },
 }
 
@@ -78,7 +80,7 @@ impl PortHeader {
         match self {
             PortHeader::Var { dir, .. }
             | PortHeader::Net { dir, .. }
-            | PortHeader::Interface { dir } => *dir,
+            | PortHeader::Interface { dir, .. } => *dir,
         }
     }
 
@@ -505,12 +507,20 @@ impl LowerModuleCtx<'_> {
         use ast::PortHeader::*;
         // A generic interface port carries no net/var header and no direction
         // syntax; only its direction inherits from a preceding interface port.
-        if let InterfacePortHeader(_) = header {
+        if let InterfacePortHeader(header) = header {
             let dir = match prev_header {
-                PortHeader::Interface { dir } => dir,
+                PortHeader::Interface { dir, .. } => dir,
                 _ => PortDirection::default(),
             };
-            return PortHeader::Interface { dir };
+            return PortHeader::Interface {
+                dir,
+                interface: lower_ident_opt(
+                    header
+                        .name_or_keyword()
+                        .filter(|token| token.kind() != TokenKind::INTERFACE_KEYWORD),
+                ),
+                modport: lower_ident_opt(header.modport().and_then(|part| part.member())),
+            };
         }
         let (ast_dir, port_kind, ast_ty) = match header {
             VariablePortHeader(header) => {
@@ -573,7 +583,9 @@ impl LowerModuleCtx<'_> {
         match prev_header {
             PortHeader::Var { var_kw, ty, .. } => PortHeader::Var { dir, var_kw, ty },
             PortHeader::Net { net_ty, .. } => PortHeader::Net { dir, net_ty },
-            PortHeader::Interface { .. } => PortHeader::Interface { dir },
+            PortHeader::Interface { interface, modport, .. } => {
+                PortHeader::Interface { dir, interface, modport }
+            }
         }
     }
 

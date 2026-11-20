@@ -18,14 +18,14 @@ struct ParseSyntaxTreeOptions;
 
 class Compilation {
   public:
-    explicit Compilation(std::vector<std::string> top_modules);
+    Compilation(std::vector<std::string> top_modules, std::vector<std::string> parameter_overrides);
 
     std::vector<std::string> top_modules;
     std::shared_ptr<syntax::SourceSession> session;
     std::unique_ptr<::slang::ast::Compilation> inner;
 };
 
-std::unique_ptr<Compilation> new_compilation(rust::Vec<rust::String> top_modules);
+std::unique_ptr<Compilation> new_compilation(rust::Vec<rust::String> top_modules, rust::Vec<rust::String> parameter_overrides);
 std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_text(
     Compilation& compilation,
     rust::Str text,
@@ -36,13 +36,24 @@ std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_text(
 void register_source_buffers(
     Compilation& compilation,
     rust::Vec<rust::String> paths,
-    rust::Vec<rust::String> texts
+    rust::Vec<rust::String> texts,
+    rust::Vec<rust::String> libraries
 );
 std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_buffer(
     Compilation& compilation,
     rust::Str name,
     rust::Str path,
-    ParseSyntaxTreeOptions options
+    ParseSyntaxTreeOptions options,
+    bool library_unit
+);
+std::shared_ptr<syntax::SyntaxTree> parse_grouped_sources(
+    Compilation& compilation,
+    rust::Vec<rust::String> paths,
+    rust::Vec<rust::String> predefines,
+    rust::Vec<rust::String> include_paths
+);
+std::shared_ptr<syntax::SyntaxTree> project_source_file(
+    const syntax::SyntaxTree& group, rust::Str path
 );
 std::shared_ptr<syntax::SyntaxTree> parse_library_map_syntax_tree_from_text(
     Compilation& compilation,

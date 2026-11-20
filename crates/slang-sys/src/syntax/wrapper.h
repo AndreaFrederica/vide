@@ -41,11 +41,12 @@ namespace slang_sys::syntax {
 
         SourceSession();
         void assign_include_buffer(std::string path, std::string text);
-        void assign_source_buffer(std::string path, std::string text);
+        void assign_source_buffer(std::string path, std::string text, std::string library = {});
         slang::SourceBuffer source_buffer(std::string_view path) const;
 
       private:
         std::unordered_map<std::string, std::string> buffers;
+        std::unordered_map<std::string, slang::SourceLibrary> libraries;
         std::unordered_map<std::string, slang::SourceBuffer> source_buffers;
     };
 
@@ -54,6 +55,7 @@ namespace slang_sys::syntax {
     class SyntaxTree {
       public:
         std::shared_ptr<::slang::syntax::SyntaxTree> tree;
+        std::shared_ptr<::slang::syntax::SyntaxTree> source_owner;
         std::shared_ptr<SourceSession> session;
         uint32_t root_buffer_id;
 
@@ -92,6 +94,15 @@ namespace slang_sys::syntax {
             bool collect_expected_syntax,
             std::size_t expected_syntax_offset,
             bool has_expected_syntax_offset
+        );
+        std::shared_ptr<SyntaxTree> parse_grouped_sources(
+            const std::shared_ptr<SourceSession>& session,
+            const rust::Vec<rust::String>& paths,
+            rust::Vec<rust::String> predefines,
+            rust::Vec<rust::String> include_paths
+        );
+        std::shared_ptr<SyntaxTree> project_source_file(
+            const SyntaxTree& group, rust::Str path
         );
         std::shared_ptr<SyntaxTree> parse_syntax_tree_with_session(
             const std::shared_ptr<SourceSession>& session,

@@ -25,6 +25,8 @@ pub(crate) type LspRouter = Router<GlobalState>;
 pub(crate) fn router() -> LspRouter {
     use lsp_types::{notification::*, request::*};
 
+    use crate::lsp_ext::trace::{TraceDrivers, TraceLoads};
+
     macro_rules! requests {
         ($router:ident; $($request:ty => $policy:expr, $handler:path;)*) => {
             $($router.request::<$request>($policy, $handler);)*
@@ -70,6 +72,8 @@ pub(crate) fn router() -> LspRouter {
         CodeActionRequest => RequestPolicy::WORKER_NO_RETRY, request::handle_code_action;
         CodeActionResolveRequest => RequestPolicy::WORKER_NO_RETRY, request::handle_code_action_resolve;
         SelectionRangeRequest => RequestPolicy::WORKER, request::handle_selection_range;
+        TraceDrivers => RequestPolicy::WORKER_NO_RETRY, request::handle_trace_drivers;
+        TraceLoads => RequestPolicy::WORKER_NO_RETRY, request::handle_trace_loads;
     );
     notifications!(router;
         Cancel => notification::handle_cancel;

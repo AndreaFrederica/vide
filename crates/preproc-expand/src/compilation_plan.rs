@@ -1,5 +1,5 @@
 use base_db::{
-    project::{CompilationProfileId, ProjectConfig},
+    project::{CompilationProfileId, ExplicitCompilationInputs, PreprocessConfig, ProjectConfig},
     source_db::{SourceFileKind, SourceRootDb},
     source_root::SourceRootId,
 };
@@ -17,15 +17,23 @@ use vfs::FileId;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompilationPlan {
     pub source_roots: Vec<SourceRootId>,
+    /// Primary roots, explicit source libraries, then library maps.
     pub roots: Vec<FileId>,
+    primary_root_count: usize,
+    library_map_start: usize,
+    pub compilation_units: Option<Vec<Vec<FileId>>>,
+    pub compilation_unit_options: Option<Vec<PreprocessConfig>>,
+    pub source_libraries: Vec<(FileId, String)>,
     /// Files reached through literal SystemVerilog include directives. They are
     /// made available to slang through include buffers, but are not added
     /// as standalone semantic roots.
     pub include_only: FxHashSet<FileId>,
     pub include_dirs: Vec<AbsPathBuf>,
     pub top_modules: Vec<String>,
+    pub parameter_overrides: Vec<String>,
     pub predefines: Vec<String>,
     pub include_scan_issues: Vec<IncludeScanIssue>,
+    pub missing_ordered_sources: Vec<AbsPathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,9 +45,42 @@ pub struct IncludeScanIssue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IncludeScanIssueReason {
     Model(SourcePreprocError),
+    UnresolvedInclude(String),
 }
 
 impl CompilationPlan {
+    pub fn source_library(&self, file: FileId) -> &str {
+        self.source_libraries
+            .iter()
+            .find(|(id, _)| *id == file)
+            .map_or("work", |(_, name)| name.as_str())
+    }
+
+    pub fn unit_options_for_file(&self, file: FileId) -> Option<&PreprocessConfig> {
+        let index =
+            self.compilation_units.as_ref()?.iter().position(|unit| unit.contains(&file))?;
+        self.compilation_unit_options.as_ref()?.get(index)
+    }
+
+    pub(crate) fn preprocessor_root(&self, file: FileId) -> FileId {
+        self.compilation_units
+            .as_ref()
+            .and_then(|units| units.iter().find(|unit| unit.contains(&file)))
+            .map_or(file, |unit| unit[0])
+    }
+
+    pub fn primary_roots(&self) -> &[FileId] {
+        &self.roots[..self.primary_root_count]
+    }
+
+    pub fn library_roots(&self) -> &[FileId] {
+        &self.roots[self.primary_root_count..self.library_map_start]
+    }
+
+    pub fn library_maps(&self) -> &[FileId] {
+        &self.roots[self.library_map_start..]
+    }
+
     /// Every file the plan compiles: semantic roots plus include-only files,
     /// in stable order without duplicates.
     pub fn all_file_ids(&self) -> Vec<FileId> {
@@ -59,7 +100,15 @@ impl CompilationPlan {
     ) -> bool {
         matches!(db.file_kind(file_id), SourceFileKind::IncludeHeader)
             && db.file_path(file_id).is_some_and(|path| {
-                self.include_dirs.iter().any(|include_dir| path.starts_with(include_dir))
+                self.include_dirs
+                    .iter()
+                    .chain(
+                        self.compilation_unit_options
+                            .iter()
+                            .flatten()
+                            .flat_map(|unit| &unit.include_dirs),
+                    )
+                    .any(|include_dir| path.starts_with(include_dir))
             })
     }
 
@@ -76,7 +125,14 @@ impl CompilationPlan {
             .then_some(source_root_id);
         let (source_roots, top_modules, include_dirs, predefines) =
             profile_inputs(&project_config, root_scoped_source_root, profile_id);
-        Self::from_inputs(db, source_roots, top_modules, include_dirs, predefines)
+        Self::from_inputs(
+            db,
+            source_roots,
+            top_modules,
+            include_dirs,
+            predefines,
+            project_config.explicit_inputs(profile_id),
+        )
     }
 
     pub fn for_profile(db: &dyn SourceRootDb, profile_id: Option<CompilationProfileId>) -> Self {
@@ -85,7 +141,14 @@ impl CompilationPlan {
             profile_inputs(&project_config, None, profile_id);
         let source_roots =
             if source_roots.is_empty() { all_non_ignored_roots(db) } else { source_roots };
-        Self::from_inputs(db, source_roots, top_modules, include_dirs, predefines)
+        Self::from_inputs(
+            db,
+            source_roots,
+            top_modules,
+            include_dirs,
+            predefines,
+            project_config.explicit_inputs(profile_id),
+        )
     }
 
     fn from_inputs(
@@ -94,18 +157,176 @@ impl CompilationPlan {
         top_modules: Vec<String>,
         include_dirs: Vec<AbsPathBuf>,
         predefines: Vec<String>,
+        explicit: Option<&ExplicitCompilationInputs>,
     ) -> Self {
-        let (include_only, include_scan_issues) =
-            include_targets_for_source_roots(db, &source_roots, &include_dirs, &predefines);
-        let roots = compile_roots_for_source_roots(db, &source_roots, &include_only);
+        let declared_unit_options =
+            explicit.and_then(|inputs| inputs.compilation_unit_options.as_ref());
+        let (mut include_only, mut include_scan_issues) = if declared_unit_options.is_some() {
+            (FxHashSet::default(), Vec::new())
+        } else {
+            include_targets_for_source_roots(db, &source_roots, &include_dirs, &predefines)
+        };
+        let mut missing_ordered_sources = Vec::new();
+        let ordered_sources = explicit.and_then(|inputs| inputs.sources.as_deref());
+        let library_files = explicit.map_or(&[][..], |inputs| inputs.library_files.as_slice());
+        let library_map_paths = explicit.map_or(&[][..], |inputs| inputs.library_maps.as_slice());
+        let index = (ordered_sources.is_some()
+            || !library_files.is_empty()
+            || !library_map_paths.is_empty())
+        .then(|| path_file_ids(db));
+        let mut roots = match (ordered_sources, index.as_ref()) {
+            (Some(ordered_sources), Some(index)) => ordered_sources
+                .iter()
+                .filter_map(|path| {
+                    let file = index
+                        .get_path(path)
+                        .filter(|file| db.file_kind(*file).is_semantic_compilation_unit());
+                    if file.is_none() {
+                        missing_ordered_sources.push(path.clone());
+                    }
+                    file
+                })
+                .collect(),
+            _ => compile_roots_for_source_roots(db, &source_roots, &include_only),
+        };
+        let mut compilation_unit_options = declared_unit_options.map(|_| Vec::new());
+        let compilation_units = explicit
+            .and_then(|inputs| inputs.compilation_units.as_ref())
+            .zip(index.as_ref())
+            .map(|(units, index)| {
+                let mut seen = FxHashSet::default();
+                units
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(unit_index, unit)| {
+                        let files = unit
+                            .iter()
+                            .filter_map(|path| match index.get_path(path) {
+                                Some(file)
+                                    if matches!(
+                                        db.file_kind(file),
+                                        SourceFileKind::SystemVerilog
+                                    ) && seen.insert(file) =>
+                                {
+                                    Some(file)
+                                }
+                                _ => {
+                                    if !missing_ordered_sources.contains(path) {
+                                        missing_ordered_sources.push(path.clone());
+                                    }
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        if files.is_empty() {
+                            return None;
+                        }
+                        if let Some(options) = &mut compilation_unit_options {
+                            options.push(declared_unit_options.unwrap()[unit_index].clone());
+                        }
+                        Some(files)
+                    })
+                    .collect::<Vec<_>>()
+            });
+        if let Some(units) = &compilation_units {
+            roots = units.iter().flatten().copied().collect();
+        }
+        let mut library_roots = Vec::new();
+        if let Some(index) = index.as_ref().filter(|_| !library_files.is_empty()) {
+            let mut library_ids = FxHashSet::default();
+            for path in library_files {
+                match index
+                    .get_path(path)
+                    .filter(|file| matches!(db.file_kind(*file), SourceFileKind::SystemVerilog))
+                {
+                    Some(file) if library_ids.insert(file) => library_roots.push(file),
+                    Some(_) => {}
+                    None => missing_ordered_sources.push(path.clone()),
+                }
+            }
+            if ordered_sources.is_some() {
+                let primary_ids = roots.iter().copied().collect::<FxHashSet<_>>();
+                library_roots.retain(|file| !primary_ids.contains(file));
+            } else {
+                roots.retain(|file| !library_ids.contains(file));
+            }
+        }
+        if let Some((units, options)) =
+            compilation_units.as_ref().zip(compilation_unit_options.as_ref())
+        {
+            let file_ids = path_file_ids(db);
+            let mut merge_scan = |files: &[FileId], dirs: &[AbsPathBuf], macros: &[String]| {
+                let (included, issues) =
+                    include_targets_for_files(db, files.to_vec(), dirs, macros, &file_ids);
+                include_only.extend(included);
+                include_scan_issues.extend(issues);
+            };
+            for (files, options) in units.iter().zip(options) {
+                let dirs =
+                    include_dirs.iter().chain(&options.include_dirs).cloned().collect::<Vec<_>>();
+                let macros = predefines
+                    .iter()
+                    .cloned()
+                    .chain(options.predefine_strings())
+                    .collect::<Vec<_>>();
+                merge_scan(files, &dirs, &macros);
+            }
+            merge_scan(&library_roots, &include_dirs, &predefines);
+        }
+        let mut library_maps = Vec::new();
+        if let Some(index) = index.as_ref().filter(|_| !library_map_paths.is_empty()) {
+            let mut seen = FxHashSet::default();
+            for path in library_map_paths {
+                if let Some(file) = index
+                    .get_path(path)
+                    .filter(|file| db.file_kind(*file) == SourceFileKind::LibraryMap)
+                {
+                    if seen.insert(file) {
+                        library_maps.push(file);
+                    }
+                } else {
+                    missing_ordered_sources.push(path.clone());
+                }
+            }
+            roots.retain(|file| !seen.contains(file));
+        }
+        let primary_root_count = roots.len();
+        roots.extend(library_roots);
+        let library_map_start = roots.len();
+        roots.extend(library_maps);
+        let source_libraries = explicit
+            .zip(index.as_ref())
+            .filter(|(inputs, _)| !inputs.source_libraries.is_empty())
+            .map_or_else(Vec::new, |(inputs, index)| {
+                let root_ids = roots.iter().copied().collect::<FxHashSet<_>>();
+                inputs
+                    .source_libraries
+                    .iter()
+                    .filter_map(|(path, name)| {
+                        index
+                            .get_path(path)
+                            .filter(|file| root_ids.contains(file))
+                            .map(|file| (file, name.clone()))
+                    })
+                    .collect()
+            });
         CompilationPlan {
             source_roots,
             roots,
+            primary_root_count,
+            library_map_start,
+            compilation_units,
+            compilation_unit_options,
+            source_libraries,
             include_only,
             include_dirs,
             top_modules,
+            parameter_overrides: explicit
+                .map(|inputs| inputs.parameter_overrides.clone())
+                .unwrap_or_default(),
             predefines,
             include_scan_issues,
+            missing_ordered_sources,
         }
     }
 }
@@ -281,13 +502,23 @@ fn include_targets_for_source_roots(
     predefines: &[String],
 ) -> (FxHashSet<FileId>, Vec<IncludeScanIssue>) {
     let path_file_ids = path_file_ids(db);
+    let mut files = Vec::new();
+    for root_id in roots {
+        files.extend(db.source_root(*root_id).iter());
+    }
+    include_targets_for_files(db, files, include_dirs, predefines, &path_file_ids)
+}
+
+fn include_targets_for_files(
+    db: &dyn SourceRootDb,
+    mut pending: Vec<FileId>,
+    include_dirs: &[AbsPathBuf],
+    predefines: &[String],
+    path_file_ids: &PathIdentityIndex<FileId>,
+) -> (FxHashSet<FileId>, Vec<IncludeScanIssue>) {
     let mut included = FxHashSet::default();
     let mut issues = Vec::new();
     let mut scanned = FxHashSet::default();
-    let mut pending = Vec::new();
-    for root_id in roots {
-        pending.extend(db.source_root(*root_id).iter());
-    }
 
     while let Some(file_id) = pending.pop() {
         if !scanned.insert(file_id) {
@@ -318,10 +549,16 @@ fn include_targets_for_source_roots(
             let MacroIncludeTarget::Literal { path, .. } = &include.target else {
                 continue;
             };
-            if let Some(included_file_id) =
-                resolve_include_target(path.as_str(), &includer_path, include_dirs, &path_file_ids)
-                && included.insert(included_file_id)
-            {
+            let Some(included_file_id) =
+                resolve_include_target(path.as_str(), &includer_path, include_dirs, path_file_ids)
+            else {
+                issues.push(IncludeScanIssue {
+                    file_id,
+                    reason: IncludeScanIssueReason::UnresolvedInclude(path.to_string()),
+                });
+                continue;
+            };
+            if included.insert(included_file_id) {
                 pending.push(included_file_id);
             }
         }

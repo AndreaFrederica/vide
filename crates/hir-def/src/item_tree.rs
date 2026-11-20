@@ -308,10 +308,12 @@ fn build_item_tree_data(
     let mut parents = Vec::new();
     let mut body_depth = 0usize;
     let root = tree.root();
-    assert_eq!(
-        root.kind(),
-        syntax::SyntaxKind::COMPILATION_UNIT,
-        "item tree requires a compilation-unit syntax root"
+    assert!(
+        matches!(
+            root.kind(),
+            syntax::SyntaxKind::COMPILATION_UNIT | syntax::SyntaxKind::LIBRARY_MAP
+        ),
+        "item tree requires a compilation-unit or library-map syntax root"
     );
     for event in root.elem_preorder() {
         match event {
@@ -613,6 +615,20 @@ mod tests {
     fn build(file_id: HirFileId, text: &str) -> ItemTree {
         let tree = parse(text);
         build_item_tree(file_id, &tree, &AstIdMap::from_source(&tree), Some(text))
+    }
+
+    #[test]
+    fn library_map_items_can_be_indexed_with_rtl_sources() {
+        let text =
+            "library cells lib/cell.sv;\nconfig chosen; design work.top; endconfig\n";
+        let tree = SyntaxTree::from_library_map_text(text, "design.map", "design.map");
+        let items = build_item_tree(
+            HirFileId::File(FileId::from_raw(0)),
+            &tree,
+            &AstIdMap::from_source(&tree),
+            Some(text),
+        );
+        assert_eq!(items.len(), 2);
     }
 
     #[test]

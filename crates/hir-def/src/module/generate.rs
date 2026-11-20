@@ -161,6 +161,12 @@ impl LowerGenerateBlockCtx<'_> {
             }
             NetAlias(alias) => BodyItem::NetAliasId(self.lower_net_alias(alias)?),
             LetDeclaration(declaration) => BodyItem::LetDeclId(self.lower_let_decl(declaration)?),
+            ImmediateAssertionMember(assertion) => {
+                self.lower_immediate_assertion_member(assertion).into()
+            }
+            ConcurrentAssertionMember(assertion) => {
+                self.lower_concurrent_assertion_member(assertion).into()
+            }
             ProceduralBlock(proc) => self.lower_proc(proc).into(),
             GenerateBlock(block) => BodyItem::GenerateBlockOwner(
                 self.intern_generate_node(generate_block_source_node(block)),
@@ -370,6 +376,12 @@ impl LowerModuleCtx<'_> {
                 if let Some(let_decl) = self.lower_let_decl(declaration) {
                     items.push(let_decl.into());
                 }
+            }
+            ImmediateAssertionMember(assertion) => {
+                items.push(self.lower_immediate_assertion_member(assertion).into());
+            }
+            ConcurrentAssertionMember(assertion) => {
+                items.push(self.lower_concurrent_assertion_member(assertion).into());
             }
             HierarchyInstantiation(instantiation) => {
                 items.push(self.lower_instantiation(instantiation).into());

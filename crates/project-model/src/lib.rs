@@ -19,7 +19,10 @@ use utils::{
 };
 use vfs::{FileSetConfig, FileSetFilter, PathGlobMatcher, PathMatcher, VfsPath};
 use workspace_model::{
-    project::{CompilationProfile, CompilationProfileId, PreprocessConfig, ProjectConfig},
+    project::{
+        CompilationProfile, CompilationProfileId, ExplicitCompilationInputs, PreprocessConfig,
+        ProjectConfig,
+    },
     source_root::{SourceRootConfig, SourceRootId, SourceRootRole},
 };
 
@@ -130,6 +133,7 @@ impl WorkspaceKind {
 struct WorkspaceSemanticProfile {
     top_modules: Vec<String>,
     preprocess: PreprocessConfig,
+    explicit_inputs: ExplicitCompilationInputs,
 }
 
 enum ManifestSourcePolicy {
@@ -184,16 +188,27 @@ impl Workspace {
         let TomlWorkspace {
             manifest_path,
             top_modules,
+            parameter_overrides,
             workspace_root,
             macro_defs,
             source_patterns,
+            source_files,
+            compilation_units,
+            compilation_unit_options,
+            library_files,
+            library_maps,
+            source_libraries,
             include_dirs,
             libraries,
             exclude_patterns,
         } = toml;
 
         let kind = WorkspaceKind::from_is_lib(is_lib);
-        let source_policy = ManifestSourcePolicy::from_manifest(source_patterns);
+        let source_policy = ManifestSourcePolicy::from_manifest(if source_files.is_some() {
+            Some(Vec::new())
+        } else {
+            source_patterns
+        });
         let source_patterns = validate_manifest_patterns(source_policy.patterns(), "sources")?;
         let exclude_patterns = validate_manifest_patterns(exclude_patterns, "exclude")?;
         let exclude_prefixes = exclude_prefixes_from_patterns(&workspace_root, &exclude_patterns);
@@ -205,7 +220,10 @@ impl Workspace {
                 || PathMatcher::all_under_roots(Vec::new()),
                 |matcher| PathMatcher::glob(source_locations.matcher_roots.clone(), matcher),
             );
-        let has_source_paths = source_locations.has_load_paths();
+        let has_source_paths = source_locations.has_load_paths()
+            || source_files.as_ref().is_some_and(|files| !files.is_empty())
+            || !library_files.is_empty()
+            || !library_maps.is_empty();
         let source_directories = compile_manifest_globs(
             &workspace_root,
             source_locations.directory_patterns,
@@ -221,22 +239,58 @@ impl Workspace {
         } else {
             &[]
         };
-        let include_dirs = resolve_include_dirs(include_dirs, default_include_paths);
+        let include_dirs = if source_files.is_some() {
+            include_dirs.unwrap_or_default()
+        } else {
+            resolve_include_dirs(include_dirs, default_include_paths)
+        };
         let library_paths = resolve_library_paths(libraries);
         let root_parts = WorkspaceRootParts {
             source,
             source_directories,
-            source_files: source_locations.source_files,
+            source_files: source_files
+                .clone()
+                .unwrap_or(source_locations.source_files)
+                .into_iter()
+                .chain(library_files.iter().cloned())
+                .chain(library_maps.iter().cloned())
+                .collect(),
             extra_files: vec![manifest_path.clone()],
-            include_dirs: include_dirs.clone(),
+            include_dirs: include_dirs
+                .iter()
+                .cloned()
+                .chain(
+                    compilation_unit_options
+                        .iter()
+                        .flatten()
+                        .flat_map(|unit| unit.include_dirs.iter().cloned()),
+                )
+                .collect(),
             exclude_prefixes,
             exclude_globs,
         };
         let roots = workspace_roots(kind, &source_policy, has_source_paths, root_parts);
-        let semantic_profile = roots
-            .iter()
-            .any(WorkspaceRoot::contributes_semantic_profile)
-            .then(|| semantic_profile(top_modules, macro_defs, include_dirs, Some(manifest_path)));
+        let semantic_profile =
+            roots.iter().any(WorkspaceRoot::contributes_semantic_profile).then(|| {
+                let predefines = if source_files.is_some() {
+                    macro_defs.to_ordered_predefines(&manifest_path)
+                } else {
+                    macro_defs.to_predefines(Some(&manifest_path))
+                };
+                WorkspaceSemanticProfile {
+                    top_modules,
+                    preprocess: PreprocessConfig { predefines, include_dirs },
+                    explicit_inputs: ExplicitCompilationInputs {
+                        sources: source_files,
+                        compilation_units,
+                        compilation_unit_options,
+                        library_files,
+                        library_maps,
+                        source_libraries,
+                        parameter_overrides,
+                    },
+                }
+            });
 
         Ok(Self { workspace_root, library_paths, kind, roots, semantic_profile })
     }
@@ -299,6 +353,7 @@ fn semantic_profile(
 ) -> WorkspaceSemanticProfile {
     WorkspaceSemanticProfile {
         top_modules,
+        explicit_inputs: ExplicitCompilationInputs::default(),
         preprocess: PreprocessConfig {
             predefines: macro_defs.to_predefines(manifest_path.as_ref()),
             include_dirs,
@@ -779,6 +834,7 @@ pub fn get_workspace_folder(
         dependency_roots_by_workspace(workspaces, &root_ids_by_workspace);
     let mut root_profiles = vec![None; source_root_count];
     let mut profiles = Vec::new();
+    let mut explicit_inputs = Vec::new();
 
     for loaded_root in loaded_roots {
         if !loaded_root.role.participates_in_semantic_profile() {
@@ -815,10 +871,12 @@ pub fn get_workspace_folder(
             top_modules: profile.top_modules.clone(),
             preprocess: profile.preprocess.clone(),
         });
+        explicit_inputs.push(profile.explicit_inputs.clone());
     }
 
     let fileset_config = fsc.build();
-    let project_config = Arc::new(ProjectConfig::new(root_profiles, profiles));
+    let project_config =
+        Arc::new(ProjectConfig::new(root_profiles, profiles).with_explicit_inputs(explicit_inputs));
 
     (load, watch, SourceRootConfig { fileset_config, fileset_roles }, project_config)
 }

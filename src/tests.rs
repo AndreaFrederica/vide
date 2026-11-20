@@ -58,6 +58,87 @@ use crate::{
 
 type TempDir = TestDir;
 
+#[test]
+fn trace_requests_return_versioned_dependencies_and_frontier() {
+    use crate::lsp_ext::trace::{TraceDrivers, TraceLoads, TraceOptions, TraceParams, TraceResult};
+
+    let text = "module top(input logic clk, input logic a);
+wire b; logic q;
+assign b = a;
+always @(posedge clk) q <= b;
+endmodule
+module other(input logic a, output wire c);
+assign c = a;
+endmodule";
+    let (_directory, client, server, uri) = setup_configured_diagnostics_test(
+        ClientCapabilities::default(),
+        UserConfig::default(),
+        text,
+    );
+    let request =
+        |id: i32, method: &str, position, options: TraceOptions| {
+            let params = TraceParams {
+                position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                options,
+            };
+            for attempt in 0..100 {
+                let id = lsp_server::RequestId::from(id + attempt);
+                client
+                    .sender
+                    .send(Message::Request(Request::new(id.clone(), method.to_owned(), &params)))
+                    .unwrap();
+                let response = recv_raw_response(&client, id, "RTL trace");
+                if response.error.as_ref().is_some_and(|error| {
+                    error.code == lsp_server::ErrorCode::ContentModified as i32
+                }) {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                assert!(response.error.is_none(), "{:?}", response.error);
+                return serde_json::from_value::<TraceResult>(response.result.unwrap()).unwrap();
+            }
+            panic!("RTL trace kept receiving concurrent workspace updates");
+        };
+    let result =
+        request(101, TraceDrivers::METHOD, position_of(text, "q <= b"), TraceOptions::default());
+    assert_eq!(result.schema_version, 1);
+    assert_eq!(result.scope, "file");
+    assert_eq!(result.signals[result.root].name, "q");
+    assert_eq!(result.assignments.len(), 2);
+    assert_eq!(result.assignments[0].kind, "nonblocking");
+    let process = result.assignments[0].process.as_ref().unwrap();
+    assert_eq!(process.uri, uri);
+    assert_eq!(process.range.start, position_of(text, "always @"));
+    assert!(result.assignments[1].process.is_none());
+    assert!(
+        result.assignments[0].inputs.iter().any(|input| input.edge.as_deref() == Some("rising"))
+    );
+    assert!(result.frontier.is_empty());
+    let loads = request(
+        201,
+        TraceLoads::METHOD,
+        position_of(text, "a;"),
+        TraceOptions { max_depth: Some(1), ..TraceOptions::default() },
+    );
+    assert_eq!(loads.signals[loads.root].name, "a");
+    assert_eq!(loads.assignments.len(), 1);
+    assert_eq!(loads.frontier[0].reason, "depth");
+    let module = request(
+        301,
+        TraceDrivers::METHOD,
+        Position::new(0, 0),
+        TraceOptions { module: Some("top".into()), ..TraceOptions::default() },
+    );
+    assert_eq!(module.scope, "module");
+    assert_eq!(module.assignments.len(), 2);
+    assert!(module.signals.iter().all(|signal| signal.name != "c"));
+    assert!(module.frontier.is_empty());
+    shutdown_test_server(&client, server);
+}
+
 const LSP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_TEST_CONFIG: &str = "sources = [\"**\"]\ninclude_dirs = [\".\"]\n";

@@ -11,6 +11,7 @@ use crate::{
     covergroup::{CovergroupId, CoverpointId, CrossId},
     db::HirDefDb,
     def_id::DefId,
+    dpi::DpiImportId,
     expr::declarator::DeclId,
     file::{config::ConfigDeclId, library::LibraryDeclId, udp::UdpDeclId},
     module::{
@@ -45,6 +46,7 @@ pub enum DefOriginLoc {
     Block(OwnerId),
     GenerateBlock(OwnerId),
     Subroutine(OwnerId),
+    DpiImport(OwnerRef<DpiImportId>),
     SubroutinePort(OwnerRef<SubroutinePortId>),
     NonAnsiPort(OwnerRef<NonAnsiPortId>),
     Decl(OwnerRef<DeclId>),
@@ -69,6 +71,7 @@ impl_from! { DefOriginLoc =>
     Config(InFile<ConfigDeclId>),
     Library(InFile<LibraryDeclId>),
     Udp(InFile<UdpDeclId>),
+    DpiImport(OwnerRef<DpiImportId>),
     SubroutinePort(OwnerRef<SubroutinePortId>),
     NonAnsiPort(OwnerRef<NonAnsiPortId>),
     Decl(OwnerRef<DeclId>),
@@ -117,7 +120,7 @@ macro_rules! trivial_kind {
 
 impl DefOriginLoc {
     trivial_kind! {
-        Config, Library, Udp, Block, GenerateBlock, Subroutine, SubroutinePort, NonAnsiPort,
+        Config, Library, Udp, Block, GenerateBlock, Subroutine, DpiImport, SubroutinePort, NonAnsiPort,
         Typedef, Instance, Modport, ClockingBlock, ClockingSignal, Checker, CheckerPort,
         Covergroup, Property, Sequence, Coverpoint, Cross, Stmt, EnumMember, StructMember,
     }
@@ -138,6 +141,7 @@ impl DefOriginLoc {
                 subroutine.parent(db).expect("subroutine owner must have a parent")
             }
             DefOriginLoc::SubroutinePort(OwnerRef { cont_id, .. })
+            | DefOriginLoc::DpiImport(OwnerRef { cont_id, .. })
             | DefOriginLoc::ClockingSignal(OwnerRef { cont_id, .. })
             | DefOriginLoc::CheckerPort(OwnerRef { cont_id, .. })
             | DefOriginLoc::Coverpoint(OwnerRef { cont_id, .. })
@@ -173,6 +177,8 @@ impl DefOrigin {
     impl_origin_cast!(as_generate_block, GenerateBlock, OwnerId);
 
     impl_origin_cast!(as_subroutine, Subroutine, OwnerId);
+
+    impl_origin_cast!(as_dpi_import, DpiImport, OwnerRef<DpiImportId>);
 
     impl_origin_cast!(as_subroutine_port, SubroutinePort, OwnerRef<SubroutinePortId>);
 
@@ -219,6 +225,7 @@ pub enum DefKind {
     Block,
     GenerateBlock,
     Subroutine,
+    DpiImport,
     SubroutinePort,
     NonAnsiPort,
     Typedef,
@@ -277,7 +284,7 @@ impl DefKind {
             Self::Library => Self::Library,
             Self::Block => Self::Block,
             Self::GenerateBlock => Self::Generate,
-            Self::Subroutine => Self::Fn,
+            Self::Subroutine | Self::DpiImport => Self::Fn,
             Self::NonAnsiPort => Self::NonAnsiPortLabel,
             Self::SubroutinePort | Self::Port => Self::PortDecl,
             Self::CheckerPort => Self::PortDecl,

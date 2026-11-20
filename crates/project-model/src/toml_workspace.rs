@@ -55,6 +55,9 @@ struct TomlManifestSchema {
         )
     )]
     pub top_modules: Vec<String>,
+    /// Top-level SystemVerilog parameter overrides in NAME=value form.
+    #[serde(default)]
+    pub parameter_overrides: Vec<String>,
     /// Predefined macros. Use NAME or NAME=value strings.
     #[serde(deserialize_with = "de_macros", default)]
     #[cfg_attr(
@@ -82,6 +85,31 @@ struct TomlManifestSchema {
         )
     )]
     pub sources: Option<Vec<String>>,
+    /// Literal compilation inputs in simulator order, relative to this manifest
+    /// or absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "manifest-schema", schemars(with = "Option<Vec<String>>"))]
+    pub source_files: Option<Vec<Utf8PathBuf>>,
+    /// Ordered groups of files parsed together. The groups must partition
+    /// source_files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "manifest-schema", schemars(with = "Option<Vec<Vec<String>>>"))]
+    pub compilation_units: Option<Vec<Vec<Utf8PathBuf>>>,
+    /// Additional preprocessing options for each entry in compilation_units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compilation_unit_options: Option<Vec<TomlCompilationUnitOptions>>,
+    /// Explicit Verilog source library files, each parsed in its own
+    /// compilation unit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "manifest-schema", schemars(with = "Vec<String>"))]
+    pub library_files: Vec<Utf8PathBuf>,
+    /// Library map files containing source mappings or SystemVerilog configs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "manifest-schema", schemars(with = "Vec<String>"))]
+    library_maps: Vec<Utf8PathBuf>,
+    /// Named Verilog libraries for specific compilation inputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_libraries: Vec<TomlSourceLibrary>,
     /// Include search directories. When omitted and sources is set explicitly,
     /// Vide uses the scan roots inferred from sources. Explicit
     /// include_dirs = [] disables this fallback.
@@ -144,6 +172,27 @@ pub fn generated_toml_manifest_schema() -> serde_json::Value {
     schema
 }
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "manifest-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+struct TomlCompilationUnitOptions {
+    #[serde(default, deserialize_with = "de_macros")]
+    #[cfg_attr(feature = "manifest-schema", schemars(with = "Vec<String>"))]
+    defines: MacroDef,
+    #[serde(default)]
+    #[cfg_attr(feature = "manifest-schema", schemars(with = "Vec<String>"))]
+    include_dirs: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "manifest-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+struct TomlSourceLibrary {
+    #[cfg_attr(feature = "manifest-schema", schemars(with = "String"))]
+    path: Utf8PathBuf,
+    name: String,
+}
+
 fn de_macros<'de, D>(deserializer: D) -> Result<MacroDef, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -202,9 +251,16 @@ fn spanned_text_range(span: std::ops::Range<usize>) -> Result<TextRange, String>
 pub struct TomlWorkspace {
     pub manifest_path: AbsPathBuf,
     pub top_modules: Vec<String>,
+    pub parameter_overrides: Vec<String>,
     pub workspace_root: AbsPathBuf,
     pub macro_defs: MacroDef,
     pub source_patterns: Option<Vec<String>>,
+    pub source_files: Option<Vec<AbsPathBuf>>,
+    pub compilation_units: Option<Vec<Vec<AbsPathBuf>>>,
+    pub compilation_unit_options: Option<Vec<workspace_model::PreprocessConfig>>,
+    pub library_files: Vec<AbsPathBuf>,
+    pub library_maps: Vec<AbsPathBuf>,
+    pub source_libraries: Vec<(AbsPathBuf, String)>,
     pub include_dirs: Option<Vec<AbsPathBuf>>,
     pub libraries: Vec<AbsPathBuf>,
     pub exclude_patterns: Vec<String>,
@@ -219,6 +275,14 @@ impl TomlWorkspace {
             toml::from_str(&toml_file).with_context(|| format!("failed to parse {:?}", toml))?;
 
         let top_modules = toml_schema.top_modules;
+        let parameter_overrides = toml_schema.parameter_overrides;
+        for parameter in &parameter_overrides {
+            anyhow::ensure!(
+                parameter.split_once('=').is_some_and(|(name, value)| !name.trim().is_empty()
+                    && !value.trim().is_empty()),
+                "Invalid parameter override {parameter:?}"
+            );
+        }
         let workspace_root = toml
             .parent()
             .with_context(|| format!("manifest path has no parent: {toml}"))?
@@ -229,6 +293,92 @@ impl TomlWorkspace {
             paths.into_iter().map(|path| workspace_root.absolutize(path)).collect::<Vec<_>>()
         });
         let source_patterns = toml_schema.sources;
+        let source_files = toml_schema.source_files.map(|paths| {
+            paths.into_iter().map(|path| workspace_root.absolutize(path)).collect::<Vec<_>>()
+        });
+        anyhow::ensure!(
+            source_patterns.is_none() || source_files.is_none(),
+            "sources and source_files are mutually exclusive"
+        );
+        let compilation_units = toml_schema.compilation_units.map(|units| {
+            units
+                .into_iter()
+                .map(|unit| {
+                    unit.into_iter().map(|path| workspace_root.absolutize(path)).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(units) = &compilation_units {
+            anyhow::ensure!(
+                units.iter().all(|unit| !unit.is_empty())
+                    && source_files.as_ref().is_some_and(|files| {
+                        units.iter().flatten().eq(files)
+                            && files.iter().collect::<std::collections::HashSet<_>>().len()
+                                == files.len()
+                    }),
+                "compilation_units must partition source_files in order, with each source listed once"
+            );
+        }
+        let compilation_unit_options = toml_schema.compilation_unit_options.map(|options| {
+            options
+                .into_iter()
+                .map(|unit| workspace_model::PreprocessConfig {
+                    predefines: unit.defines.to_ordered_predefines(toml),
+                    include_dirs: unit
+                        .include_dirs
+                        .into_iter()
+                        .map(|path| workspace_root.absolutize(path))
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(options) = &compilation_unit_options {
+            anyhow::ensure!(
+                compilation_units.as_ref().is_some_and(|units| units.len() == options.len()),
+                "compilation_unit_options must have one entry per compilation unit"
+            );
+        }
+        let library_files = toml_schema
+            .library_files
+            .into_iter()
+            .map(|path| workspace_root.absolutize(path))
+            .collect::<Vec<_>>();
+        let library_maps = toml_schema
+            .library_maps
+            .into_iter()
+            .map(|path| workspace_root.absolutize(path))
+            .collect::<Vec<_>>();
+        let source_libraries = toml_schema
+            .source_libraries
+            .into_iter()
+            .map(|entry| (workspace_root.absolutize(entry.path), entry.name))
+            .collect::<Vec<_>>();
+        if !source_libraries.is_empty() {
+            let source_paths = source_files
+                .iter()
+                .flatten()
+                .chain(&library_files)
+                .collect::<std::collections::HashSet<_>>();
+            let mut names = std::collections::HashMap::new();
+            for (path, name) in &source_libraries {
+                anyhow::ensure!(
+                    source_paths.contains(path)
+                        && !name.trim().is_empty()
+                        && names.insert(path, name.as_str()).is_none(),
+                    "source_libraries must name each explicit source at most once: {path}"
+                );
+            }
+            for unit in compilation_units.iter().flatten() {
+                let mut libraries =
+                    unit.iter().map(|path| names.get(path).copied().unwrap_or("work"));
+                if let Some(first) = libraries.next() {
+                    anyhow::ensure!(
+                        libraries.all(|library| library == first),
+                        "Each compilation unit must belong to one source library"
+                    );
+                }
+            }
+        }
         let libraries = toml_schema
             .libraries
             .into_iter()
@@ -239,9 +389,16 @@ impl TomlWorkspace {
         Ok(TomlWorkspace {
             manifest_path: toml.clone(),
             top_modules,
+            parameter_overrides,
             workspace_root,
             macro_defs,
             source_patterns,
+            source_files,
+            compilation_units,
+            compilation_unit_options,
+            library_files,
+            library_maps,
+            source_libraries,
             include_dirs,
             libraries,
             exclude_patterns,

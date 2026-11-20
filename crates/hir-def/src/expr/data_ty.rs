@@ -345,7 +345,8 @@ impl<Store: LoweringStore> LoweringCtx<Store> {
             LogicType(_) => Either::Right(VecKind::Logic),
         };
 
-        let signing = Self::lower_signing(ty.signing()).unwrap_or(matches!(kind, Either::Left(_)));
+        let signing = Self::lower_signing(ty.signing())
+            .unwrap_or(matches!(kind, Either::Left(kind) if kind != IntKind::Time));
 
         let dimensions = ty.dimensions().children().map(|dim| self.lower_dimension(dim)).collect();
         match kind {

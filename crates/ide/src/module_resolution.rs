@@ -92,6 +92,28 @@ pub(crate) fn resolve_module_name(
     name: &Ident,
 ) -> ModuleResolution {
     let policy = ModuleResolutionPolicy::for_file(db, from_file);
+    let profile = db.file_compilation_profile(from_file);
+    if db
+        .project_config()
+        .explicit_inputs(profile)
+        .is_some_and(|inputs| !inputs.source_libraries.is_empty())
+    {
+        let plan = db.compilation_plan_for_profile(profile);
+        let library = plan.source_library(from_file);
+        let local = module_candidates(db, name)
+            .into_iter()
+            .filter(|owner| {
+                owner.file(db).source_file_id(db).is_some_and(|file| {
+                    plan.roots.contains(&file) && plan.source_library(file) == library
+                })
+            })
+            .collect::<Vec<_>>();
+        match local.as_slice() {
+            [owner] => return ModuleResolution::Unique(*owner),
+            [] => {}
+            _ => return policy.resolve_ambiguous(db, local),
+        }
+    }
     resolve_module_name_with_policy(db, name, policy)
 }
 
@@ -174,34 +196,34 @@ pub(crate) fn resolve_connection_port(
     idx: usize,
 ) -> Resolution<DefId> {
     match conn {
-        PortConn::Empty | PortConn::Ordered(_) => {
-            let module = db.body_with_source_map(target_module_id);
-            match &module.ports {
-                Ports::NonAnsi { ports, .. } => {
-                    let Some((port_id, _)) = ports.iter().nth(idx) else {
-                        return Resolution::Unresolved;
-                    };
-                    Resolution::Unique(DefId::from_source(
-                        db,
-                        OwnerRef::new(target_module_id, port_id),
-                    ))
-                }
-                Ports::Ansi(_) => {
-                    let Some(port_decl_id) = ansi_port_decl_id_by_idx(&module, idx) else {
-                        return Resolution::Unresolved;
-                    };
-                    let Some(decl_id) = module.get(port_decl_id).decls.clone().next() else {
-                        return Resolution::Unresolved;
-                    };
-                    Resolution::Unique(DefId::from_source(
-                        db,
-                        OwnerRef::new(target_module_id, decl_id),
-                    ))
-                }
-            }
-        }
+        PortConn::Empty | PortConn::Ordered(_) => resolve_ordered_port(db, target_module_id, idx),
         PortConn::Named(Some(name), _) => resolve_named_port_in_module(db, target_module_id, name),
         PortConn::Named(None, _) | PortConn::Wildcard => Resolution::Unresolved,
+    }
+}
+
+pub(crate) fn resolve_ordered_port(
+    db: &dyn WorkspaceSymbolIndexDb,
+    target_module_id: OwnerId,
+    index: usize,
+) -> Resolution<DefId> {
+    let module = db.body_with_source_map(target_module_id);
+    match &module.ports {
+        Ports::NonAnsi { ports, .. } => {
+            let Some((port_id, _)) = ports.iter().nth(index) else {
+                return Resolution::Unresolved;
+            };
+            Resolution::Unique(DefId::from_source(db, OwnerRef::new(target_module_id, port_id)))
+        }
+        Ports::Ansi(_) => {
+            let Some(port_decl_id) = ansi_port_decl_id_by_idx(&module, index) else {
+                return Resolution::Unresolved;
+            };
+            let Some(decl_id) = module.get(port_decl_id).decls.clone().next() else {
+                return Resolution::Unresolved;
+            };
+            Resolution::Unique(DefId::from_source(db, OwnerRef::new(target_module_id, decl_id)))
+        }
     }
 }
 

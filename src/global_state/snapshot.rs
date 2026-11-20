@@ -74,6 +74,7 @@ pub(crate) struct GlobalStateSnapshot {
     pub(super) accepted_response_effects: AcceptedResponseEffects,
     pub(crate) mem_docs: MemDocs,
     pub(crate) vfs: Arc<RwLock<(Vfs, IntMap<FileId, LineEnding>)>>,
+    pub(crate) workspace_ready: bool,
     #[allow(dead_code)]
     pub(crate) workspaces: Arc<Vec<Workspace>>,
 }
