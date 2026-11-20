@@ -12,6 +12,8 @@ import {
 } from 'vscode-languageclient/node';
 
 import { getBundledServerPath, getPlatformFolder } from './platform';
+import { createAnalysisApi, type VideAnalysisApi, type VideTraceProject } from './analysisApi';
+import { openTraceProject } from './traceProject';
 import { registerDiagnosticActions } from './diagnosticActions';
 import { profileDiagnosticsCommand, registerProfilingCommand } from './profiling';
 import { serverInitializationOptions } from './initializationOptions';
@@ -983,7 +985,9 @@ function affectsServerLaunchConfiguration(event: vscode.ConfigurationChangeEvent
   );
 }
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+export async function activate(context: vscode.ExtensionContext): Promise<VideAnalysisApi> {
+  const traceProjects = new Set<VideTraceProject>();
+  context.subscriptions.push({ dispose: () => traceProjects.forEach((project) => project.dispose()) });
   outputChannel = vscode.window.createOutputChannel(languageServerOutputChannelName);
   context.subscriptions.push(outputChannel);
   qiheOutputChannel = vscode.window.createOutputChannel(qiheOutputChannelName);
@@ -1106,6 +1110,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   void promptForMissingProjectConfigs(context);
 
   log('[INFO] Vide extension activated');
+  async function startTraceProject(input: Parameters<typeof openTraceProject>[0]) {
+    if (!vscode.workspace.isTrusted) throw new Error('Open the trace project in a trusted workspace.');
+    const launch = resolveServerLaunch(context, readConfiguration());
+    const project = await openTraceProject(
+      input,
+      { ...launch, args: [...launch.args, ...launch.additionalArgs], env: createServerEnv() },
+      log,
+    );
+    traceProjects.add(project);
+    return {
+      get closed() { return project.closed; },
+      traceDrivers: project.traceDrivers,
+      traceLoads: project.traceLoads,
+      dispose() {
+        traceProjects.delete(project);
+        project.dispose();
+      },
+    };
+  }
+  return Object.assign(createAnalysisApi(() => client), {
+    openTraceProject: (manifest: string) => startTraceProject({ manifest }),
+    openTraceProjectFile: (manifestPath: string) => startTraceProject({ manifestPath }),
+  });
 }
 
 export async function deactivate(): Promise<void> {
