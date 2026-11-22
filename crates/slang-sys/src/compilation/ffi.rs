@@ -47,6 +47,7 @@ mod slang_ffi {
         fn new_compilation(
             top_modules: Vec<String>,
             parameter_overrides: Vec<String>,
+            default_timescale: &str,
         ) -> UniquePtr<Compilation>;
         fn parse_syntax_tree_from_text(
             compilation: Pin<&mut Compilation>,

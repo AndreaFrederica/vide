@@ -55,9 +55,15 @@ struct TomlManifestSchema {
         )
     )]
     pub top_modules: Vec<String>,
-    /// Top-level SystemVerilog parameter overrides in NAME=value form.
+    /// SystemVerilog parameter overrides. Use NAME=value for a top-level parameter or top.instance.NAME=value for an explicit hierarchy path.
     #[serde(default)]
     pub parameter_overrides: Vec<String>,
+    /// Default RTL time unit and precision, for example 1ns/1ps.
+    #[serde(default)]
+    pub default_timescale: Option<String>,
+    /// External system subroutines with unverified argument directions.
+    #[serde(default)]
+    pub external_system_calls: Vec<String>,
     /// Predefined macros. Use NAME or NAME=value strings.
     #[serde(deserialize_with = "de_macros", default)]
     #[cfg_attr(
@@ -239,6 +245,26 @@ where
     Ok(MacroDef { macros, sources })
 }
 
+fn normalize_timescale(value: &str) -> anyhow::Result<String> {
+    static SCALE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(1|10|100) *(s|ms|us|ns|ps|fs) */ *(1|10|100) *(s|ms|us|ns|ps|fs)$")
+            .expect("valid timescale grammar")
+    });
+    let captures = SCALE
+        .captures(value.trim())
+        .with_context(|| format!("Invalid default_timescale {value:?}"))?;
+    let exponent = |magnitude: &str, unit: &str| {
+        let units = ["s", "ms", "us", "ns", "ps", "fs"];
+        let index = units.iter().position(|candidate| *candidate == unit).unwrap();
+        magnitude.len() as i32 - 3 * index as i32
+    };
+    anyhow::ensure!(
+        exponent(&captures[3], &captures[4]) <= exponent(&captures[1], &captures[2]),
+        "Default timescale precision exceeds the time unit in {value:?}",
+    );
+    Ok(format!("{}{}/{}{}", &captures[1], &captures[2], &captures[3], &captures[4]))
+}
+
 fn spanned_text_range(span: std::ops::Range<usize>) -> Result<TextRange, String> {
     let start = u32::try_from(span.start)
         .map_err(|_| format!("manifest range start is too large: {}", span.start))?;
@@ -252,6 +278,8 @@ pub struct TomlWorkspace {
     pub manifest_path: AbsPathBuf,
     pub top_modules: Vec<String>,
     pub parameter_overrides: Vec<String>,
+    pub default_timescale: Option<String>,
+    pub external_system_calls: Vec<String>,
     pub workspace_root: AbsPathBuf,
     pub macro_defs: MacroDef,
     pub source_patterns: Option<Vec<String>>,
@@ -278,11 +306,18 @@ impl TomlWorkspace {
         let parameter_overrides = toml_schema.parameter_overrides;
         for parameter in &parameter_overrides {
             anyhow::ensure!(
-                parameter.split_once('=').is_some_and(|(name, value)| !name.trim().is_empty()
-                    && !value.trim().is_empty()),
+                parameter.split_once('=').is_some_and(
+                    |(name, value)| !name.trim().is_empty() && !value.trim().is_empty()
+                ),
                 "Invalid parameter override {parameter:?}"
             );
         }
+        let default_timescale =
+            toml_schema.default_timescale.as_deref().map(normalize_timescale).transpose()?;
+        let mut external_system_calls = toml_schema.external_system_calls;
+        anyhow::ensure!(external_system_calls.len() <= 16384, "Too many external system calls");
+        external_system_calls.sort_unstable();
+        external_system_calls.dedup();
         let workspace_root = toml
             .parent()
             .with_context(|| format!("manifest path has no parent: {toml}"))?
@@ -390,6 +425,8 @@ impl TomlWorkspace {
             manifest_path: toml.clone(),
             top_modules,
             parameter_overrides,
+            default_timescale,
+            external_system_calls,
             workspace_root,
             macro_defs,
             source_patterns,

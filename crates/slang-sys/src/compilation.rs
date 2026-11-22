@@ -29,7 +29,21 @@ impl Compilation {
     }
 
     pub fn new_with_options(top_modules: &[String], parameter_overrides: &[String]) -> Self {
-        Self { raw: ffi::new_compilation(top_modules.to_vec(), parameter_overrides.to_vec()) }
+        Self::new_with_timescale(top_modules, parameter_overrides, None)
+    }
+
+    pub fn new_with_timescale(
+        top_modules: &[String],
+        parameter_overrides: &[String],
+        default_timescale: Option<&str>,
+    ) -> Self {
+        Self {
+            raw: ffi::new_compilation(
+                top_modules.to_vec(),
+                parameter_overrides.to_vec(),
+                default_timescale.unwrap_or_default(),
+            ),
+        }
     }
 
     pub fn add_syntax_tree(&mut self, tree: &SyntaxTree) {
@@ -229,6 +243,36 @@ mod tests {
 
         assert!(compilation.parse_diagnostics_with_options(&[]).is_empty());
         assert!(compilation.semantic_diagnostics_with_options(&[]).is_empty());
+    }
+
+    #[test]
+    fn default_timescale_applies_only_to_modules_without_an_explicit_unit() {
+        let tree = SyntaxTree::from_file_in_memory(
+            r#"
+            module implicit_time;
+                if (10ns != 10.0) begin : check_unit $error("implicit timescale"); end
+            endmodule
+            module explicit_time;
+                timeunit 10ns / 100ps;
+                if (10ns != 1.0) begin : check_unit $error("explicit timescale"); end
+            endmodule
+            "#,
+            "timescale",
+            "timescale.sv",
+        );
+        let diagnostics = |timescale| {
+            let mut compilation = Compilation::new_with_timescale(&[], &[], Some(timescale));
+            compilation.add_syntax_tree(&tree);
+            compilation.semantic_diagnostics_with_options(&[])
+        };
+        let initial = diagnostics("1ns/1ps");
+        assert!(initial.is_empty(), "{initial:?}");
+        let changed = diagnostics("10ns/100ps");
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert!(
+            changed[0].message.contains("implicit timescale")
+                || changed[0].args.iter().any(|arg| arg.contains("implicit timescale"))
+        );
     }
 
     #[test]

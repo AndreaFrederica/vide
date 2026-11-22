@@ -79,6 +79,18 @@ enum AccessSite<'a> {
     CallArgument(ast::Argument<'a>),
 }
 
+pub(crate) fn is_direct_call_argument(
+    token: SyntaxTokenWithParent<'_>,
+    invocation: ast::InvocationExpression<'_>,
+) -> bool {
+    match access_site(token) {
+        AccessSite::CallArgument(argument) => {
+            argument.syntax().parent().and_then(|list| list.parent()) == Some(invocation.syntax())
+        }
+        _ => false,
+    }
+}
+
 fn access_site(token: SyntaxTokenWithParent<'_>) -> AccessSite<'_> {
     use ReferenceCategory as Access;
     use SyntaxKind as Kind;

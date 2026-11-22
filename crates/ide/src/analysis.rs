@@ -84,8 +84,18 @@ impl AnalysisSnapshot {
         file_id: FileId,
         module: &str,
         budget: TraceBudget,
+        hierarchical_only: bool,
     ) -> Cancellable<Option<(Vec<assignment_trace::TraceSignal>, Vec<assignment_trace::AssignmentRelation>, bool)>> {
-        self.with_db(|db| assignment_trace::module_assignments(db, file_id, module, budget))
+        self.with_db(|db| assignment_trace::module_assignments(db, file_id, module, budget, hierarchical_only))
+    }
+
+    pub fn hierarchical_reference_modules(
+        &self,
+        root: hir_def::def_id::DefId,
+        signals: &[assignment_trace::TraceSignal],
+        direction: TraceDirection,
+    ) -> Cancellable<rustc_hash::FxHashMap<hir_def::def_id::DefId, assignment_trace::HierarchicalReferenceModules>> {
+        self.with_db(|db| assignment_trace::hierarchical_reference_modules(db, root, signals, direction))
     }
 
     pub fn trace_file_assignments(

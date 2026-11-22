@@ -26,7 +26,7 @@ use crate::{
     dpi::{DpiExport, DpiExportId, DpiImport, DpiImportId},
     elab_system_task::{ElabSystemTask, ElabSystemTaskId},
     expr::{
-        Expr, ExprId,
+        Expr, ExprId, data_ty::Dimension,
         declarator::{DeclId, Declarator, empty_decls_range},
         timing_control::{EventExpr, EventExprId},
     },
@@ -699,10 +699,12 @@ impl<Store: crate::lower::LoweringStore> LoweringCtx<Store> {
 
     pub(crate) fn lower_body_enum_type(&mut self, enum_ty: ast::EnumType) -> EnumId {
         let base_ty = enum_ty.base_type().map(|ty| self.lower_data_ty(ty));
-        let members = enum_ty
-            .members()
-            .children()
-            .map(|declarator| EnumMember {
+        let mut members = SmallVec::new();
+        // Match Slang's default enum member limit so a range in an editor
+        // buffer cannot cause unbounded symbol generation.
+        const MAX_ENUM_MEMBERS: usize = 65_535;
+        for declarator in enum_ty.members().children() {
+            let member = EnumMember {
                 name: lower_ident_opt(declarator.name()),
                 initializer: declarator.initializer().map(|init| self.lower_expr(init.expr())),
                 dimensions: declarator
@@ -710,9 +712,41 @@ impl<Store: crate::lower::LoweringStore> LoweringCtx<Store> {
                     .children()
                     .map(|dim| self.lower_dimension(dim))
                     .collect(),
+                generated: false,
                 source: self.source_id(declarator.syntax()),
-            })
-            .collect();
+            };
+            let expressions = self.expressions().0;
+            let bound = |id| match &expressions[id] {
+                Expr::Literal(crate::literal::Literal::Int(value)) => {
+                    value.serialize(10).parse::<i32>().ok().filter(|bound| *bound >= 0)
+                }
+                _ => None,
+            };
+            let range = match member.dimensions.as_slice() {
+                [Some(Dimension::Size(count))] => bound(*count)
+                    .filter(|count| *count > 0)
+                    .map(|count| (0, count - 1)),
+                [Some(Dimension::Range(left, right))] => bound(*left).zip(bound(*right)),
+                _ => None,
+            };
+            if let Some((left, right)) = range
+                && let Some(name) = &member.name
+                && members.len().saturating_add(left.abs_diff(right) as usize + 1) <= MAX_ENUM_MEMBERS
+            {
+                for offset in 0..=left.abs_diff(right) as i32 {
+                    let suffix = if left <= right { left + offset } else { left - offset };
+                    members.push(EnumMember {
+                        name: Some(format!("{name}{suffix}").into()),
+                        initializer: if offset == 0 { member.initializer } else { None },
+                        dimensions: SmallVec::new(),
+                        generated: true,
+                        source: member.source,
+                    });
+                }
+            } else {
+                members.push(member);
+            }
+        }
         let dimensions =
             enum_ty.dimensions().children().map(|dim| self.lower_dimension(dim)).collect();
         let enum_def = EnumDef { base_ty, members, dimensions };

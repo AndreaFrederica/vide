@@ -8,12 +8,15 @@ namespace slang_sys::compilation {
 namespace {
 
 ::slang::Bag make_options(const std::vector<std::string>& top_modules,
-                          std::vector<std::string> parameter_overrides) {
+                          std::vector<std::string> parameter_overrides,
+                          std::string_view default_timescale) {
     ::slang::Bag options;
     auto& compilation_options = options.insertOrGet<::slang::ast::CompilationOptions>();
     for (const auto& top_module : top_modules)
         compilation_options.topModules.emplace(top_module);
     compilation_options.paramOverrides = std::move(parameter_overrides);
+    if (!default_timescale.empty())
+        compilation_options.defaultTimeScale = ::slang::TimeScale::fromString(default_timescale);
     return options;
 }
 
@@ -28,14 +31,18 @@ std::vector<std::string> to_std_strings(const rust::Vec<rust::String>& values) {
 } // namespace
 
 Compilation::Compilation(std::vector<std::string> top_modules,
-                         std::vector<std::string> parameter_overrides) :
+                         std::vector<std::string> parameter_overrides,
+                         std::string_view default_timescale) :
     top_modules(std::move(top_modules)),
     session(std::make_shared<syntax::SourceSession>()),
-    inner(std::make_unique<::slang::ast::Compilation>(make_options(this->top_modules, std::move(parameter_overrides)))) {}
+    inner(std::make_unique<::slang::ast::Compilation>(
+        make_options(this->top_modules, std::move(parameter_overrides), default_timescale))) {}
 
 std::unique_ptr<Compilation> new_compilation(rust::Vec<rust::String> top_modules,
-                                             rust::Vec<rust::String> parameter_overrides) {
-    return std::make_unique<Compilation>(to_std_strings(top_modules), to_std_strings(parameter_overrides));
+                                             rust::Vec<rust::String> parameter_overrides,
+                                             rust::Str default_timescale) {
+    return std::make_unique<Compilation>(to_std_strings(top_modules), to_std_strings(parameter_overrides),
+                                         std::string_view(default_timescale.data(), default_timescale.size()));
 }
 
 std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_text(

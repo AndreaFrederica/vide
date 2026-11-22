@@ -26,6 +26,22 @@
       },
       "default": []
     },
+    "default_timescale": {
+      "description": "Default RTL time unit and precision, for example 1ns/1ps.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "external_system_calls": {
+      "description": "External system subroutines with unverified argument directions.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
     "defines": {
       "description": "Predefined macros. Use NAME or NAME=value strings.",
       "type": "array",

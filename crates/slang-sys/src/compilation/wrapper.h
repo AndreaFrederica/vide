@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cxx.h"
@@ -18,14 +19,18 @@ struct ParseSyntaxTreeOptions;
 
 class Compilation {
   public:
-    Compilation(std::vector<std::string> top_modules, std::vector<std::string> parameter_overrides);
+    Compilation(std::vector<std::string> top_modules,
+                std::vector<std::string> parameter_overrides,
+                std::string_view default_timescale);
 
     std::vector<std::string> top_modules;
     std::shared_ptr<syntax::SourceSession> session;
     std::unique_ptr<::slang::ast::Compilation> inner;
 };
 
-std::unique_ptr<Compilation> new_compilation(rust::Vec<rust::String> top_modules, rust::Vec<rust::String> parameter_overrides);
+std::unique_ptr<Compilation> new_compilation(rust::Vec<rust::String> top_modules,
+                                             rust::Vec<rust::String> parameter_overrides,
+                                             rust::Str default_timescale);
 std::shared_ptr<syntax::SyntaxTree> parse_syntax_tree_from_text(
     Compilation& compilation,
     rust::Str text,

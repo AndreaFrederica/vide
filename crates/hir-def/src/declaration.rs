@@ -74,6 +74,7 @@ pub enum NetStrength {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ParamDecl {
     pub ty: DataTy,
+    pub inferred_type: bool,
     pub kind: ParamDeclKind,
     pub is_port: bool,
     pub decls: DeclsRange,
@@ -291,7 +292,7 @@ impl<Store: LoweringStore> LoweringCtx<Store> {
         let decls = empty_decls_range();
         let ty = DataTy::Builtin(BuiltinDataTyId::new(BuiltinDataTy::default()));
 
-        self.alloc_declaration(ParamDecl { ty, kind, is_port, decls }, type_param_decl)
+        self.alloc_declaration(ParamDecl { ty, inferred_type: false, kind, is_port, decls }, type_param_decl)
     }
 
     fn lower_param_decl(
@@ -306,10 +307,16 @@ impl<Store: LoweringStore> LoweringCtx<Store> {
             inherited_kind,
             force_local,
         );
-        let ty = self.lower_data_ty(param_decl.type_());
+        let syntax_type = param_decl.type_();
+        let inferred_type = matches!(
+            &syntax_type,
+            ast::DataType::ImplicitType(ty)
+                if ty.signing().is_none() && ty.dimensions().children().next().is_none()
+        );
+        let ty = self.lower_data_ty(syntax_type);
 
         let parent = self.alloc_declaration(
-            ParamDecl { ty, kind, is_port, decls: empty_decls_range() },
+            ParamDecl { ty, inferred_type, kind, is_port, decls: empty_decls_range() },
             param_decl,
         );
         let decls = self.lower_declarators(param_decl.declarators(), parent.into());

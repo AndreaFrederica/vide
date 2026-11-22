@@ -256,8 +256,11 @@ fn parsed_profile(db: &dyn PreprocDb, key: PreprocProfileQueryKey) -> Arc<Parsed
     )
     .entered();
 
-    let mut session =
-        Compilation::new_with_options(&context.top_modules, &context.parameter_overrides);
+    let mut session = Compilation::new_with_timescale(
+        &context.top_modules,
+        &context.parameter_overrides,
+        context.default_timescale.as_deref(),
+    );
     if plan.source_libraries.is_empty() {
         session.register_source_buffers(&source_buffers);
     } else {
@@ -691,6 +694,7 @@ fn compilation_context(
         plan.top_modules.clone(),
     );
     context.parameter_overrides = plan.parameter_overrides.clone().into();
+    context.default_timescale = plan.default_timescale.as_deref().map(Arc::from);
     Arc::new(context)
 }
 
@@ -772,8 +776,11 @@ fn compilation_profile_diagnostics(
 
     let context = db.compilation_context(Some(profile_id));
     let parsed_profile = db.parsed_profile(Some(profile_id));
-    let mut compilation =
-        Compilation::new_with_options(&context.top_modules, &context.parameter_overrides);
+    let mut compilation = Compilation::new_with_timescale(
+        &context.top_modules,
+        &context.parameter_overrides,
+        context.default_timescale.as_deref(),
+    );
     let mut buffer_file_ids = FxHashMap::default();
     let path_file_ids = path_file_ids(db);
 

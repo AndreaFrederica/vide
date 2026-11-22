@@ -41,6 +41,7 @@ pub struct CompilationContext {
     pub library_maps: Arc<[FileId]>,
     pub top_modules: Arc<[String]>,
     pub parameter_overrides: Arc<[String]>,
+    pub default_timescale: Option<Arc<str>>,
 }
 
 impl CompilationContext {
@@ -60,6 +61,7 @@ impl CompilationContext {
             library_maps: library_maps.into(),
             top_modules: top_modules.into(),
             parameter_overrides: Vec::new().into(),
+            default_timescale: None,
         }
     }
 

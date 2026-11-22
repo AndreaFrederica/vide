@@ -189,6 +189,8 @@ impl Workspace {
             manifest_path,
             top_modules,
             parameter_overrides,
+            default_timescale,
+            external_system_calls,
             workspace_root,
             macro_defs,
             source_patterns,
@@ -288,6 +290,8 @@ impl Workspace {
                         library_maps,
                         source_libraries,
                         parameter_overrides,
+                        default_timescale,
+                        external_system_calls,
                     },
                 }
             });

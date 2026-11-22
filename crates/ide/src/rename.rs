@@ -1,5 +1,5 @@
 use base_db::source_db::SourceDb;
-use hir_def::{container::InFile, def_id::DefId, symbol::DefOrigin};
+use hir_def::{container::InFile, def_id::DefId, symbol::{DefOrigin, DefOriginLoc}};
 use hir_semantics::semantics::Semantics;
 use nohash_hasher::IntMap;
 use preproc_expand::{
@@ -95,6 +95,8 @@ pub enum RenameError {
     ProjectScopeRequired,
     #[error("Cannot rename a macro-generated definition")]
     MacroDefinitionNotEditable,
+    #[error("Cannot rename one member of an enumerated range")]
+    GeneratedEnumMemberNotEditable,
     #[error("Macro rename failed: {0:?}")]
     MacroRenameFailed(PreprocError),
 }
@@ -426,6 +428,12 @@ fn resolve_hdl_rename_target(
 
     let selected_def = selected_def.ok_or(RenameError::NoDefFound)?;
     let targets = targets.into_vec();
+    if let DefOriginLoc::EnumMember { enum_id, index } =
+        selected_def.declaration_origin(sema.db).loc(sema.db)
+        && enum_id.cont_id.data(sema.db).enum_def(enum_id.value).members[*index as usize].generated
+    {
+        return Err(RenameError::GeneratedEnumMemberNotEditable);
+    }
     if targets
         .iter()
         .flat_map(|def| def.origins(sema.db))
@@ -809,6 +817,15 @@ mod tests {
 
     fn check_expanded_rename(text: &str, new_name: &str, expected: &str) {
         assert_eq!(apply_rename(text, new_name, true), expected);
+    }
+
+    #[test]
+    fn rejects_renaming_a_single_member_of_an_enumerated_range() {
+        let source = "module m; typedef enum { STATE[2] } t; t value = /*caret*/STATE1; endmodule";
+        let (db, file_id, offset) = db_with_caret(source);
+        let config = RenameConfig::workspace(ScopeVisibility::Public);
+        let result = prepare_rename(&db, FilePosition { file_id, offset }, config);
+        assert!(matches!(result, Err(RenameError::GeneratedEnumMemberNotEditable)), "{result:?}");
     }
 
     #[test]

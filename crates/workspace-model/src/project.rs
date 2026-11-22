@@ -89,6 +89,8 @@ pub struct ExplicitCompilationInputs {
     pub library_maps: Vec<AbsPathBuf>,
     pub source_libraries: Vec<(AbsPathBuf, String)>,
     pub parameter_overrides: Vec<String>,
+    pub default_timescale: Option<String>,
+    pub external_system_calls: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

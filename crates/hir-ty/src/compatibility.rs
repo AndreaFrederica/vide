@@ -1,10 +1,15 @@
 use hir_def::{
+    declaration::Declaration,
     expr::{
         BinaryOp, Expr, ExprId, UnaryOp,
         data_ty::{BuiltinDataTy, Dimension, IntKind},
+        declarator::DeclaratorParent,
     },
     literal::Literal,
+    module::ModuleKind,
     owner::OwnerId,
+    pathres::resolve_path,
+    symbol::NameContext,
 };
 
 use crate::{
@@ -139,6 +144,30 @@ fn eval_const_i128(db: &dyn TyDb, container: &OwnerId, expr_id: ExprId) -> Optio
     let data = container.data(db);
     match data.expr(expr_id) {
         Expr::Literal(Literal::Int(int)) => int.get_single_word().map(|value| value as i128),
+        Expr::Ident(name) => {
+            let def = resolve_path(db, *container, std::slice::from_ref(name), NameContext::Value)
+                .unique()?;
+            let decl = def.declaration_origin(db).as_decl(db)?;
+            // Package parameters cannot be overridden by an instance.
+            if decl.cont_id.module_kind(db) != Some(ModuleKind::Package) {
+                return None;
+            }
+            let owner = decl.cont_id.data(db);
+            let declarator = owner.declarator(decl.value);
+            let DeclaratorParent::DeclarationId(parent) = declarator.parent else {
+                return None;
+            };
+            let Declaration::ParamDecl(parameter) = owner.declaration(parent) else {
+                return None;
+            };
+            if !parameter.inferred_type || !declarator.dimensions.is_empty() {
+                return None;
+            }
+            let Expr::Literal(Literal::Int(value)) = owner.expr(declarator.initializer?) else {
+                return None;
+            };
+            value.serialize(10).parse().ok()
+        }
         Expr::Unary { op, expr } => {
             let value = eval_const_i128(db, container, *expr)?;
             match op {

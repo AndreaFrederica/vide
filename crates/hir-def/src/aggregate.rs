@@ -93,6 +93,7 @@ pub struct EnumMember {
     pub name: Option<Ident>,
     pub initializer: Option<ExprId>,
     pub dimensions: SmallVec<[Option<Dimension>; 2]>,
+    pub generated: bool,
     /// Source of the member declarator, used for navigation.
     pub source: crate::ast_id_map::SourceAstId,
 }

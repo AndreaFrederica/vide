@@ -9,8 +9,10 @@ use crate::{
         lsp_error::LspError,
         to_proto,
         trace::{
-            Assignment, Frontier, GenerateBranch, GenerateLabel, Guard, HierarchicalTarget, Input,
-            InterfaceArrayAccess, Signal, TRACE_VERSION, TraceCompilation, TraceParams, TraceResult,
+            Assignment, Frontier, GenerateBranch, GenerateLabel, Guard,
+            HierarchicalReferenceModule, HierarchicalTarget, Input,
+            InterfaceArrayAccess, Signal, TRACE_VERSION, TraceCompilation, TraceParams,
+            TraceResult,
         },
     },
 };
@@ -47,18 +49,29 @@ fn trace(
         max_signals: params.options.max_signals.unwrap_or(256).clamp(1, 4096),
         max_assignments: params.options.max_assignments.unwrap_or(512).min(4096),
     };
-    let member = params.options.interface_member.as_deref()
+    let member = params
+        .options
+        .interface_member
+        .as_deref()
         .map(|member| (member, params.options.interface_backing.as_deref()));
-    let (root, signals, assignments, frontier, module_truncated) = if let Some(module) = &params.options.module {
-        let Some((signals, assignments, truncated)) = snap.analysis.module_assignments(
-            position.file_id, module, budget,
-        )? else {
+    let (root, signals, assignments, frontier, module_truncated) = if let Some(module) =
+        &params.options.module
+    {
+        let Some((signals, assignments, truncated)) =
+            snap.analysis.module_assignments(
+                position.file_id, module, budget, params.options.hierarchical_only,
+            )?
+        else {
             return Ok(None);
         };
         (None, signals, assignments, Vec::new(), truncated)
     } else {
         let trace = if !params.options.generic_interfaces.is_empty() {
-            let types = params.options.generic_interfaces.into_iter().take(128)
+            let types = params
+                .options
+                .generic_interfaces
+                .into_iter()
+                .take(128)
                 .map(|site| {
                     Ok::<_, anyhow::Error>((
                         from_proto::file_position(&snap, site.formal)?,
@@ -67,9 +80,7 @@ fn trace(
                     ))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            snap.analysis.trace_bound_assignments(
-                position, direction, budget, member, &types,
-            )?
+            snap.analysis.trace_bound_assignments(position, direction, budget, member, &types)?
         } else if member.is_some() {
             snap.analysis.trace_bound_assignments(position, direction, budget, member, &[])?
         } else {
@@ -85,19 +96,51 @@ fn trace(
         .enumerate()
         .map(|(id, signal)| (signal.def, id))
         .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut reference_modules = match root {
+        Some(root) if params.options.include_hierarchical_modules =>
+            snap.analysis.hierarchical_reference_modules(root, &signals, direction)?,
+        _ => Default::default(),
+    };
     let signals = signals
         .into_iter()
         .enumerate()
         .map(|(id, signal)| {
+            let (modules, more_modules) = match reference_modules.remove(&signal.def) {
+                Some(result) => {
+                    let modules = result.modules.into_iter().map(|module| {
+                        Ok(HierarchicalReferenceModule {
+                            name: module.name,
+                            declaration: to_proto::location(&snap, module.declaration)?,
+                        })
+                    }).collect::<anyhow::Result<_>>()?;
+                    (Some(modules), result.truncated)
+                }
+                _ => (None, false),
+            };
             let declaration = signal
                 .declaration
                 .map(|location| to_proto::location(&snap, location))
                 .transpose()?;
-            let packed_struct = signal.packed_struct
+            let packed_struct = signal
+                .packed_struct
                 .map(|location| to_proto::location(&snap, location))
                 .transpose()?;
-            Ok(Signal { id, name: signal.name, declaration, signed: signal.signed, packed_struct,
-                lexical_scope: signal.lexical_scope })
+            Ok(Signal {
+                id,
+                name: signal.name,
+                declaration,
+                hierarchical_modules: modules,
+                has_more_hierarchical_modules: more_modules.then_some(true),
+                signed: signal.signed,
+                packed_range: signal.packed_range,
+                packed_struct,
+                lexical_scope: signal.lexical_scope,
+                enum_value: signal.enum_value,
+                enum_value_unavailable: signal.enum_value_unavailable,
+                package_parameter_value: signal.package_parameter_value,
+                package_parameter_value_unavailable: signal.package_parameter_value_unavailable,
+                instance_parameter: signal.instance_parameter,
+            })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let assignments = assignments
@@ -138,8 +181,18 @@ fn trace(
                         edge: edge.map(str::to_owned),
                         location: to_proto::location(&snap, input.location)?,
                         hierarchical: input.hierarchical,
-                        interface_range: input.interface_operand.as_ref().and_then(|operand| operand.range),
-                        interface_component: input.interface_operand.as_ref().and_then(|operand| operand.component),
+                        hierarchical_path: input.hierarchical_path,
+                        hierarchical_indices: input.hierarchical_indices.into_iter()
+                            .filter_map(|(segment, expr)| Some((segment, expr.try_map(&|def| ids.get(&def).copied())?)))
+                            .collect(),
+                        interface_range: input
+                            .interface_operand
+                            .as_ref()
+                            .and_then(|operand| operand.range),
+                        interface_component: input
+                            .interface_operand
+                            .as_ref()
+                            .and_then(|operand| operand.component),
                         interface_index: input
                             .interface_operand
                             .as_ref()
@@ -168,7 +221,8 @@ fn trace(
                 .and_then(|index| index.try_map(&|def| ids.get(&def).copied()));
             let has_element_index = assignment.target_element_index.is_some();
             let has_target_field = assignment.target_field.is_some();
-            let value = assignment.value
+            let value = assignment
+                .value
                 .filter(|_| !has_target_index || target_index.is_some())
                 .and_then(|value| value.try_map(&|def| ids.get(&def).copied()));
             Ok(Assignment {
@@ -187,13 +241,23 @@ fn trace(
                         Ok(HierarchicalTarget {
                             signal: ids[&target.signal],
                             location: to_proto::location(&snap, location)?,
+                            hierarchical_path: target.hierarchical_path,
+                            hierarchical_indices: target.hierarchical_indices.into_iter()
+                                .filter_map(|(segment, expr)| Some((segment, expr.try_map(&|def| ids.get(&def).copied())?)))
+                                .collect(),
                             byte_column: snap
                                 .line_info(location.file_id)
                                 .ok()
                                 .and_then(|info| info.index.try_line_col(location.range.start()))
                                 .map(|position| position.col),
-                            interface_range: target.interface_operand.as_ref().and_then(|operand| operand.range),
-                        interface_component: target.interface_operand.as_ref().and_then(|operand| operand.component),
+                            interface_range: target
+                                .interface_operand
+                                .as_ref()
+                                .and_then(|operand| operand.range),
+                            interface_component: target
+                                .interface_operand
+                                .as_ref()
+                                .and_then(|operand| operand.component),
                             interface_index: target
                                 .interface_operand
                                 .as_ref()
@@ -217,12 +281,39 @@ fn trace(
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?,
+                case_entries: assignment
+                    .case_entries
+                    .into_iter()
+                    .map(|entry| Ok(crate::lsp_ext::trace::CaseEntry {
+                        selector: to_proto::location(&snap, entry.selector)?,
+                        body: to_proto::location(&snap, entry.body)?,
+                        default_branch: entry.default_branch,
+                    }))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+                wait_entries: assignment.wait_entries.into_iter()
+                    .map(|entry| to_proto::location(&snap, entry))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+                standalone_wait_entries: assignment.standalone_wait_entries.into_iter()
+                    .map(|entry| to_proto::location(&snap, entry))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+                wait_predicates: assignment
+                    .wait_predicates
+                    .into_iter()
+                    .filter_map(|(location, predicate)| {
+                        let expression = predicate.try_map(&|def| ids.get(&def).copied())?;
+                        Some(to_proto::location(&snap, location).map(|location| {
+                            crate::lsp_ext::trace::WaitPredicate { location, expression }
+                        }))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
                 generate_branches: assignment
                     .generate_branches
                     .into_iter()
                     .map(|branch| GenerateBranch {
                         loop_scope: branch.loop_scope,
                         loop_variable: branch.loop_variable,
+                        lone_if_condition: branch.lone_if_condition,
+                        case_without_default: branch.case_without_default,
                         selected: branch.selected.and_then(|site| generate_label(&snap, site)),
                         alternatives: branch
                             .alternatives
@@ -232,6 +323,8 @@ fn trace(
                     })
                     .collect(),
                 has_unresolved_operands: assignment.has_unresolved_operands,
+                delay_free_continuous: assignment.delay_free_continuous.then_some(true),
+                initialization_at_start: assignment.initialization_at_start.then_some(true),
                 unresolved_control_only: (assignment.unresolved_control_only && value.is_some())
                     .then_some(true),
                 target_range: assignment.target_range,
@@ -250,9 +343,12 @@ fn trace(
                 }),
                 field_value: if has_target_field { value.clone() } else { None },
                 element_value: if has_element_index { value } else { None },
-                target_indexed_part: assignment.target_indexed_part.filter(|_| target_index.is_some()),
+                target_indexed_part: assignment
+                    .target_indexed_part
+                    .filter(|_| target_index.is_some()),
                 target_index,
-                target_element_index: assignment.target_element_index
+                target_element_index: assignment
+                    .target_element_index
                     .and_then(|index| index.try_map(&|def| ids.get(&def).copied())),
             })
         })
@@ -271,13 +367,17 @@ fn trace(
                 TraceLimit::Signals => ("signals", None),
                 TraceLimit::Assignments => ("assignments", None),
                 TraceLimit::HierarchicalLoad(site, _) => ("unresolvedHierarchicalLoad", Some(site)),
-                TraceLimit::HierarchicalWrite(site, _) => ("unresolvedHierarchicalWrite", Some(site)),
+                TraceLimit::HierarchicalWrite(site, _) => {
+                    ("unresolvedHierarchicalWrite", Some(site))
+                }
                 TraceLimit::ProceduralOverride(site) => ("proceduralOverride", Some(site)),
                 TraceLimit::SubroutineEffects(site) => ("unresolvedSubroutineEffects", Some(site)),
                 TraceLimit::RuntimeInput(site) => ("unresolvedRuntimeInput", Some(site)),
                 TraceLimit::ProceduralLoop(site) => ("unresolvedProceduralLoop", Some(site)),
                 TraceLimit::ProceduralTiming(site) => ("unresolvedProceduralTiming", Some(site)),
-                TraceLimit::VirtualInterfaceBinding(site) => ("unresolvedVirtualInterfaceBinding", Some(site)),
+                TraceLimit::VirtualInterfaceBinding(site) => {
+                    ("unresolvedVirtualInterfaceBinding", Some(site))
+                }
                 TraceLimit::UpdateEvaluation(site) => ("unresolvedUpdateEvaluation", Some(site)),
             };
             Ok(Frontier {
@@ -346,6 +446,7 @@ fn trace(
             include_dirs: plan.include_dirs.iter().map(ToString::to_string).collect(),
             top_modules: plan.top_modules.clone(),
             parameter_overrides: plan.parameter_overrides.clone(),
+            default_timescale: plan.default_timescale.clone(),
             defines: plan.predefines.clone(),
             complete,
         })
@@ -373,11 +474,17 @@ fn generate_label(
     site: ide::assignment_trace::GenerateLabel,
 ) -> Option<GenerateLabel> {
     let file = site.source.file_id;
-    let position = snap.line_info(file).ok()?.index.try_line_col(site.source.range.start())?;
+    let lines = snap.line_info(file).ok()?.index;
+    let position = lines.try_line_col(site.source.range.start())?;
+    let block_end = site.block_end
+        .and_then(|offset| lines.try_line_col(offset))
+        .map(|end| [end.line, end.col]);
     Some(GenerateLabel {
         name: site.name,
         uri: to_proto::url(snap, file).ok()?,
         line: position.line,
         byte_column: position.col,
+        block_end,
+        unique_line: site.unique_line.then_some(true),
     })
 }

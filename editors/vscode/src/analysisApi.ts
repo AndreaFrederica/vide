@@ -11,7 +11,7 @@ export interface TraceResult {
   revision: string;
   scope: 'file' | 'module';
   root: number;
-  signals: Array<{ id: number; name: string; declaration: Location | null; signed?: boolean }>;
+  signals: Array<{ id: number; name: string; declaration: Location | null; signed?: boolean; packedRange?: [number, number] }>;
   assignments: Array<{
     kind: 'continuous' | 'blocking' | 'nonblocking' | 'initialization';
     location: Location;
@@ -23,6 +23,10 @@ export interface TraceResult {
       location: Location;
     }>;
     guards: Array<{ location: Location; takenWhenTrue: boolean; expression: GuardExpression | null }>;
+    caseEntries?: Array<{ selector: Location; body: Location; defaultBranch: boolean }>;
+    waitEntries?: Location[];
+    standaloneWaitEntries?: Location[];
+    waitPredicates?: Array<{ location: Location; expression: GuardExpression }>;
     hasUnresolvedOperands: boolean;
     value?: AssignmentValue;
     targetRange?: [number, number];
@@ -33,7 +37,8 @@ export interface TraceResult {
   diagnostics: string[];
   compilation?: {
     roots: string[]; files: string[]; includeDirs: string[];
-    topModules: string[]; parameterOverrides: string[]; defines: string[]; complete: boolean;
+    topModules: string[]; parameterOverrides: string[]; defaultTimescale?: string;
+    defines: string[]; complete: boolean;
   };
 }
 
@@ -44,6 +49,9 @@ export type GuardExpression =
   | { op: 'value'; args: AssignmentValue };
 
 type AssignmentValue =
+  | { op: 'typeShape'; args: [number, boolean] }
+  | { op: 'caseMatch'; args: [AssignmentValue, [AssignmentValue, AssignmentValue?][], [number, number], 'equal' | 'wildcardZ' | 'wildcardX' | 'inside'] }
+  | { op: 'membership'; args: [AssignmentValue, [AssignmentValue, AssignmentValue?][], [number, number]] }
   | { op: 'signal'; args: number }
   | { op: 'unsignedBit' | 'fillBit'; args: boolean }
   | { op: 'fillUnknown'; args: 'x' | 'z' }

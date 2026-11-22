@@ -33,6 +33,10 @@ pub(crate) struct TraceParams {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TraceOptions {
     pub module: Option<String>,
+    #[serde(default)]
+    pub hierarchical_only: bool,
+    #[serde(default)]
+    pub include_hierarchical_modules: bool,
     pub max_depth: Option<usize>,
     pub max_signals: Option<usize>,
     pub max_assignments: Option<usize>,
@@ -84,6 +88,8 @@ pub(crate) struct TraceCompilation {
     pub include_dirs: Vec<String>,
     pub top_modules: Vec<String>,
     pub parameter_overrides: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_timescale: Option<String>,
     pub defines: Vec<String>,
     pub complete: bool,
 }
@@ -106,12 +112,38 @@ pub(crate) struct Signal {
     pub id: usize,
     pub name: String,
     pub declaration: Option<Location>,
+    #[serde(rename = "hierarchicalModules", default, skip_serializing_if = "Option::is_none")]
+    pub hierarchical_modules: Option<Vec<HierarchicalReferenceModule>>,
+    #[serde(rename = "hasMoreHierarchicalModules", default, skip_serializing_if = "Option::is_none")]
+    pub has_more_hierarchical_modules: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signed: Option<bool>,
+    #[serde(rename = "packedRange", default, skip_serializing_if = "Option::is_none")]
+    pub packed_range: Option<[i32; 2]>,
     #[serde(rename = "packedStruct", skip_serializing_if = "Option::is_none")]
     pub packed_struct: Option<Location>,
     #[serde(rename = "lexicalScope", default, skip_serializing_if = "Vec::is_empty")]
     pub lexical_scope: Vec<String>,
+    #[serde(rename = "enumValue", default, skip_serializing_if = "Option::is_none")]
+    pub enum_value: Option<ide::assignment_trace::TraceEnumValue>,
+    #[serde(rename = "enumValueUnavailable", default, skip_serializing_if = "Option::is_none")]
+    pub enum_value_unavailable: Option<bool>,
+    #[serde(rename = "packageParameterValue", default, skip_serializing_if = "Option::is_none")]
+    pub package_parameter_value: Option<ide::assignment_trace::TraceEnumValue>,
+    #[serde(
+        rename = "packageParameterValueUnavailable",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub package_parameter_value_unavailable: Option<bool>,
+    #[serde(rename = "instanceParameter", default, skip_serializing_if = "Option::is_none")]
+    pub instance_parameter: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct HierarchicalReferenceModule {
+    pub name: String,
+    pub declaration: Location,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -126,6 +158,14 @@ pub(crate) struct Assignment {
     pub hierarchical_targets: Vec<HierarchicalTarget>,
     pub inputs: Vec<Input>,
     pub guards: Vec<Guard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub case_entries: Vec<CaseEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_entries: Vec<Location>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub standalone_wait_entries: Vec<Location>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_predicates: Vec<WaitPredicate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generate_branches: Vec<GenerateBranch>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +190,10 @@ pub(crate) struct Assignment {
     pub target_indexed_part: Option<ide::assignment_trace::IndexedPartSelect>,
     pub has_unresolved_operands: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_free_continuous: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initialization_at_start: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unresolved_control_only: Option<bool>,
 }
 
@@ -173,6 +217,10 @@ pub(crate) struct HierarchicalTarget {
     pub signal: usize,
     pub location: Location,
     pub byte_column: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hierarchical_path: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hierarchical_indices: Vec<(usize, ide::assignment_trace::AssignmentValue<usize>)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,6 +238,10 @@ pub(crate) struct GenerateLabel {
     pub uri: lsp_types::Url,
     pub line: u32,
     pub byte_column: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_end: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_line: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -200,6 +252,10 @@ pub(crate) struct GenerateBranch {
     pub loop_scope: bool,
     #[serde(rename = "loopVariable", default, skip_serializing_if = "Option::is_none")]
     pub loop_variable: Option<String>,
+    #[serde(rename = "loneIfCondition", default, skip_serializing_if = "Option::is_none")]
+    pub lone_if_condition: Option<ide::assignment_trace::AssignmentValue<usize>>,
+    #[serde(rename = "caseWithoutDefault", default, skip_serializing_if = "Option::is_none")]
+    pub case_without_default: Option<ide::assignment_trace::GenerateCaseMatch>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -212,6 +268,21 @@ pub(crate) struct Guard {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct WaitPredicate {
+    pub location: Location,
+    pub expression: ide::assignment_trace::GuardExpression<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CaseEntry {
+    pub selector: Location,
+    pub body: Location,
+    pub default_branch: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Input {
     pub signal: usize,
     pub kind: String,
@@ -219,6 +290,10 @@ pub(crate) struct Input {
     pub location: Location,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hierarchical: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hierarchical_path: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hierarchical_indices: Vec<(usize, ide::assignment_trace::AssignmentValue<usize>)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_column: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

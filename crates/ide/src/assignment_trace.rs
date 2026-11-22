@@ -3,7 +3,11 @@ use std::collections::VecDeque;
 use base_db::salsa;
 use hir_def::{
     container::OwnerRef, def_id::DefId, owner::{OwnerId, OwnerKind},
+    declaration::Declaration,
+    expr::{BinaryOp, Expr, ExprId, UnaryOp, declarator::{DeclId, DeclaratorParent}},
+    literal::Literal, module::{ModuleKind, port::{PortDirection, PortHeader, Ports}},
     subroutine::{SubroutineKind, SubroutinePortDir, SubroutinePortId}, symbol::DefOriginLoc,
+    ty::NetKind,
 };
 use hir_semantics::semantics::{Semantics, SemanticsImpl};
 use hir_ty::TypeSystem;
@@ -17,6 +21,7 @@ use syntax::{
     token::TokenKindExt,
 };
 use triomphe::Arc;
+use utils::get::GetRef;
 use vfs::FileId;
 
 use crate::{
@@ -69,6 +74,8 @@ pub struct AssignmentInput {
     pub kind: AssignmentInputKind,
     pub location: FileRange,
     pub hierarchical: bool,
+    pub hierarchical_path: Option<Vec<String>>,
+    pub hierarchical_indices: Vec<(usize, AssignmentValue<DefId>)>,
     pub interface_operand: Option<InterfaceOperand>,
 }
 
@@ -87,6 +94,8 @@ pub struct InterfaceOperand {
 pub struct HierarchicalTarget {
     pub signal: DefId,
     pub location: FileRange,
+    pub hierarchical_path: Option<Vec<String>>,
+    pub hierarchical_indices: Vec<(usize, AssignmentValue<DefId>)>,
     pub interface_operand: Option<InterfaceOperand>,
 }
 
@@ -99,6 +108,10 @@ pub struct AssignmentRelation {
     pub hierarchical_targets: Vec<HierarchicalTarget>,
     pub inputs: Vec<AssignmentInput>,
     pub guards: Vec<AssignmentGuard>,
+    pub case_entries: Vec<CaseEntry>,
+    pub wait_entries: Vec<FileRange>,
+    pub standalone_wait_entries: Vec<FileRange>,
+    pub wait_predicates: Vec<(FileRange, GuardExpression<DefId>)>,
     pub generate_branches: Vec<GenerateBranch>,
     pub value: Option<AssignmentValue<DefId>>,
     pub word_read: Option<(DefId, AssignmentValue<DefId>)>,
@@ -109,6 +122,8 @@ pub struct AssignmentRelation {
     pub target_element_index: Option<AssignmentValue<DefId>>,
     pub target_indexed_part: Option<IndexedPartSelect>,
     pub has_unresolved_operands: bool,
+    pub delay_free_continuous: bool,
+    pub initialization_at_start: bool,
     pub unresolved_control_only: bool,
     unresolved_effects: Vec<TraceLimit>,
 }
@@ -117,6 +132,8 @@ pub struct AssignmentRelation {
 pub struct GenerateLabel {
     pub name: String,
     pub source: FileRange,
+    pub block_end: Option<utils::line_index::TextSize>,
+    pub unique_line: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -125,6 +142,14 @@ pub struct GenerateBranch {
     pub alternatives: Vec<GenerateLabel>,
     pub loop_scope: bool,
     pub loop_variable: Option<String>,
+    pub lone_if_condition: Option<AssignmentValue<usize>>,
+    pub case_without_default: Option<GenerateCaseMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerateCaseMatch {
+    pub selector: AssignmentValue<usize>,
+    pub labels: Vec<AssignmentValue<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -148,6 +173,18 @@ pub enum AssignmentValue<T> {
     Unary(ValueUnary, Box<Self>),
     Binary(ValueBinary, Box<Self>, Box<Self>),
     Conditional(Box<Self>, Box<Self>, Box<Self>),
+    Membership(Box<Self>, Vec<Vec<Self>>, [usize; 2]),
+    CaseMatch(Box<Self>, Vec<Vec<Self>>, [usize; 2], CaseMatchKind),
+    TypeShape(u32, bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaseMatchKind {
+    Equal,
+    WildcardZ,
+    WildcardX,
+    Inside,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -244,6 +281,24 @@ impl<T> AssignmentValue<T> {
                 Box::new(yes.try_map(convert)?),
                 Box::new(no.try_map(convert)?),
             ),
+            Self::Membership(selector, labels, span) => AssignmentValue::Membership(
+                Box::new(selector.try_map(convert)?),
+                labels
+                    .into_iter()
+                    .map(|label| label.into_iter().map(|value| value.try_map(convert)).collect())
+                    .collect::<Option<_>>()?,
+                span,
+            ),
+            Self::CaseMatch(selector, labels, span, kind) => AssignmentValue::CaseMatch(
+                Box::new(selector.try_map(convert)?),
+                labels
+                    .into_iter()
+                    .map(|label| label.into_iter().map(|value| value.try_map(convert)).collect())
+                    .collect::<Option<_>>()?,
+                span,
+                kind,
+            ),
+            Self::TypeShape(width, signed) => AssignmentValue::TypeShape(width, signed),
         })
     }
 }
@@ -253,6 +308,13 @@ pub struct AssignmentGuard {
     pub location: FileRange,
     pub taken_when_true: bool,
     pub expression: Option<GuardExpression<DefId>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseEntry {
+    pub selector: FileRange,
+    pub body: FileRange,
+    pub default_branch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,8 +412,143 @@ pub struct TraceSignal {
     pub name: String,
     pub declaration: Option<FileRange>,
     pub signed: Option<bool>,
+    pub packed_range: Option<[i32; 2]>,
     pub packed_struct: Option<FileRange>,
     pub lexical_scope: Vec<String>,
+    pub enum_value: Option<TraceEnumValue>,
+    pub enum_value_unavailable: Option<bool>,
+    pub package_parameter_value: Option<TraceEnumValue>,
+    pub package_parameter_value_unavailable: Option<bool>,
+    pub instance_parameter: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HierarchicalReferenceModule {
+    pub name: String,
+    pub declaration: FileRange,
+}
+
+#[derive(Default)]
+pub struct HierarchicalReferenceModules {
+    pub modules: Vec<HierarchicalReferenceModule>,
+    pub truncated: bool,
+}
+
+pub(crate) fn hierarchical_reference_modules(
+    db: &RootDb,
+    root: DefId,
+    signals: &[TraceSignal],
+    direction: TraceDirection,
+) -> FxHashMap<DefId, HierarchicalReferenceModules> {
+    const MAX_MODULES: usize = 64;
+    let category = match direction {
+        TraceDirection::Drivers => ReferenceCategory::WRITE,
+        TraceDirection::Loads => ReferenceCategory::READ,
+    };
+    let names: FxHashSet<_> = signals.iter().map(|signal| signal.name.as_str()).collect();
+    let root_name = signals.iter().find(|signal| signal.def == root).map(|signal| signal.name.as_str());
+    let mut results: FxHashMap<_, HierarchicalReferenceModules> = signals
+        .iter()
+        .map(|signal| (signal.def, HierarchicalReferenceModules::default()))
+        .collect();
+    let mut files: Vec<_> = db.files().into_iter().collect();
+    files.sort_unstable();
+    for file_id in files {
+        db.unwind_if_revision_cancelled();
+        let references = dotted_reference_names(db, SourceFileQueryKey::new(db, file_id));
+        // A short dotted name is frequently an interface or struct access.
+        // Keep the complete search for the requested signal. Intermediate
+        // signals also get ancestor checks from the elaborated design.
+        let relevant = |name: &str, qualified| {
+            names.contains(name) && (qualified || root_name == Some(name))
+        };
+        if !references.iter().any(|(name, qualified)| relevant(name.as_str(), *qualified)) {
+            continue;
+        }
+        let tree = db.parse(file_id.into());
+        // Macro-emitted names can share offsets with other syntax tokens.
+        // Resolve the actual AST token instead of looking it up by offset.
+        for (name, token, qualified) in dotted_references(tree.root()) {
+            db.unwind_if_revision_cancelled();
+            if !relevant(name.as_str(), qualified) {
+                continue;
+            }
+            let Some(DefinitionClass::Definition(def)) =
+                DefinitionClass::resolve(db, file_id.into(), token).unique()
+            else { continue };
+            if !qualified && def != root {
+                continue;
+            }
+            let Some(result) = results.get_mut(&def) else { continue };
+            if result.truncated
+                || !access::classify(db, file_id, def, token, &ReferenceContext::Plain).contains(category)
+            {
+                continue;
+            }
+            let Some(module) = syntax::SyntaxAncestors::start_from(token.parent)
+                .find_map(ast::ModuleDeclaration::cast)
+            else { continue };
+            let Some(name) = module.name() else { continue };
+            let Some(range) = (SyntaxTokenWithParent {
+                parent: module.header().syntax(),
+                tok: name,
+            }).text_range() else { continue };
+            let module = HierarchicalReferenceModule {
+                name: name.raw_text().trim().trim_start_matches('\\').to_owned(),
+                declaration: FileRange { file_id, range },
+            };
+            if result.modules.contains(&module) {
+                continue;
+            }
+            if result.modules.len() >= MAX_MODULES {
+                result.truncated = true;
+                continue;
+            }
+            result.modules.push(module);
+        }
+    }
+    results.retain(|def, result| *def == root || !result.modules.is_empty());
+    for result in results.values_mut() {
+        result.modules.sort_by_key(|module| (module.declaration.file_id, module.declaration.range.start()));
+    }
+    results
+}
+
+#[salsa::tracked(returns(clone))]
+fn dotted_reference_names(
+    db: &dyn WorkspaceSymbolIndexDb,
+    key: SourceFileQueryKey,
+) -> Arc<FxHashMap<hir_def::Ident, bool>> {
+    let tree = db.parse(key.file_id(db).into());
+    let mut references = FxHashMap::default();
+    for (name, _, qualified) in dotted_references(tree.root()) {
+        *references.entry(name).or_default() |= qualified;
+    }
+    Arc::new(references)
+}
+
+fn dotted_references(
+    root: SyntaxNode<'_>,
+) -> impl Iterator<Item = (hir_def::Ident, SyntaxTokenWithParent<'_>, bool)> {
+    root.elem_preorder().filter_map(|event| {
+        let WalkEvent::Enter(SyntaxElement::Node(node)) = event else { return None };
+        let name = ast::ScopedName::cast(node)?;
+        if !name.separator().is_some_and(|part| part.kind() == TokenKind::DOT) {
+            return None;
+        }
+        let ast::Name::IdentifierName(right) = name.right() else { return None };
+        let tok = right.identifier()?;
+        let qualified = matches!(name.left(), ast::Name::ScopedName(left)
+            if left.separator().is_some_and(|part| part.kind() == TokenKind::DOT));
+        let ident = hir_def::lower_ident_opt(Some(tok))?;
+        Some((ident, SyntaxTokenWithParent { parent: right.syntax(), tok }, qualified))
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEnumValue {
+    pub bits: String,
+    pub signed: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -642,6 +839,7 @@ pub(crate) fn module_assignments(
     file_id: FileId,
     module: &str,
     budget: TraceBudget,
+    hierarchical_only: bool,
 ) -> Option<(Vec<TraceSignal>, Vec<AssignmentRelation>, bool)> {
     let index = file_assignment_index(
         db, SourceFileQueryKey::new(db, file_id), Vec::new(), Some(module.to_owned()),
@@ -651,6 +849,12 @@ pub(crate) fn module_assignments(
     let mut truncated = false;
     for relation in &index.assignments {
         db.unwind_if_revision_cancelled();
+        if hierarchical_only
+            && !relation.inputs.iter().any(|input| input.hierarchical_path.is_some())
+            && !relation.hierarchical_targets.iter().any(|target| target.hierarchical_path.is_some())
+        {
+            continue;
+        }
         if assignments.len() >= budget.max_assignments {
             truncated = true;
             break;
@@ -672,9 +876,30 @@ pub(crate) fn module_assignments(
 }
 
 fn trace_signal(db: &dyn WorkspaceSymbolIndexDb, def: DefId) -> TraceSignal {
+    let enum_value = trace_enum_value(db, def);
+    let enum_value_unavailable = (enum_value.is_none()
+        && matches!(def.declaration_origin(db).loc(db), DefOriginLoc::EnumMember { .. }))
+        .then_some(true);
+    let parameter = parameter_declarator(db, def).is_some();
+    let in_package = def.declaration_origin(db).container_id(db).module_kind(db) == Some(ModuleKind::Package);
+    let package_parameter = parameter && in_package;
+    let package_parameter_value = package_parameter.then(|| {
+        let value = package_parameter_value(db, def, 32, &mut 1024)?;
+        let width = value.width;
+        let bits = value.bits_at(width)?;
+        Some(TraceEnumValue { bits: format!("{bits:0width$b}"), signed: value.signed })
+    }).flatten();
+    let package_parameter_value_unavailable =
+        (package_parameter && package_parameter_value.is_none()).then_some(true);
     TraceSignal {
         def,
         signed: TypeSystem::new(db).packed_signedness_of_def(def),
+        packed_range: TypeSystem::new(db).literal_packed_range_of_def(def),
+        enum_value,
+        enum_value_unavailable,
+        package_parameter_value,
+        package_parameter_value_unavailable,
+        instance_parameter: (parameter && !in_package).then_some(true),
         lexical_scope: trace_lexical_scope(db, def),
         packed_struct: TypeSystem::new(db).package_packed_struct(def).and_then(|typedef| {
             let source = typedef.declaration_origin(db).name_range(db)?;
@@ -687,6 +912,283 @@ fn trace_signal(db: &dyn WorkspaceSymbolIndexDb, def: DefId) -> TraceSignal {
             Some(FileRange { file_id, range })
         }),
     }
+}
+
+fn trace_enum_value(db: &dyn WorkspaceSymbolIndexDb, def: DefId) -> Option<TraceEnumValue> {
+    trace_enum_value_at(db, def, 32, &mut 1024)
+}
+
+fn trace_enum_value_at(
+    db: &dyn WorkspaceSymbolIndexDb,
+    def: DefId,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<TraceEnumValue> {
+    let depth = depth.checked_sub(1)?;
+    let DefOriginLoc::EnumMember { enum_id, index } = def.declaration_origin(db).loc(db) else {
+        return None;
+    };
+    let data = enum_id.cont_id.data(db);
+    let members = data.enum_def(enum_id.value).members.get(..=*index as usize)?;
+    let (width, signed) = TypeSystem::new(db).enum_member_packed_shape(def)?;
+    if !(1..=4096).contains(&width) {
+        return None;
+    }
+    let width = width as usize;
+    for (offset, member) in members.iter().rev().enumerate() {
+        if offset % 128 == 0 {
+            db.unwind_if_revision_cancelled();
+        }
+        if !member.dimensions.is_empty() {
+            return None;
+        }
+        let Some(initializer) = member.initializer else { continue };
+        let bits = match data.expr(initializer) {
+            Expr::Literal(Literal::Int(integer)) => enum_literal_bits(integer, width)?,
+            _ => {
+                if width > u128::BITS as usize {
+                    return None;
+                }
+                let value = enum_arithmetic(db, enum_id.with_value(initializer), depth, remaining)?;
+                let evaluated_width = value.width.max(width);
+                let bits = value.bits_at(evaluated_width)?;
+                let narrowed = bits & enum_mask(width);
+                // An enum may discard only redundant bits after evaluating its initializer.
+                let widened = extend_enum_bits(narrowed, width, signed) & enum_mask(evaluated_width);
+                if widened != bits {
+                    return None;
+                }
+                format!("{narrowed:0width$b}")
+            }
+        };
+        return increment_enum_value(bits, signed, offset);
+    }
+    increment_enum_value("0".repeat(width), signed, members.len() - 1)
+}
+
+fn enum_literal_bits(integer: &syntax::value::SVInt, width: usize) -> Option<String> {
+    if integer.get_bit_width() != width || integer.has_unknown() {
+        return None;
+    }
+    let AssignmentValue::Literal(bits, _) = integer_value(integer)? else {
+        return None;
+    };
+    Some(bits)
+}
+
+// Every supported operator propagates the result's width and signedness to
+// all operands. For these operators, computing at 128 bits and masking at the
+// end preserves the low bits at every effective width. Keep both extension
+// paths until the outer expression determines which one applies.
+struct EnumArithmetic {
+    signed_bits: u128,
+    unsigned_bits: u128,
+    width: usize,
+    signed: bool,
+    has_operator: bool,
+    unsigned_width_limit: usize,
+}
+
+fn enum_mask(width: usize) -> u128 {
+    u128::MAX >> (u128::BITS as usize - width)
+}
+
+fn extend_enum_bits(bits: u128, width: usize, signed: bool) -> u128 {
+    if signed && (bits >> (width - 1)) & 1 != 0 {
+        bits | !enum_mask(width)
+    } else {
+        bits
+    }
+}
+
+impl EnumArithmetic {
+    fn from_bits(bits: &str, signed: bool) -> Option<Self> {
+        let width = bits.len();
+        if !(1..=u128::BITS as usize).contains(&width) {
+            return None;
+        }
+        let bits = u128::from_str_radix(bits, 2).ok()?;
+        Some(Self::literal(bits, width, signed))
+    }
+
+    fn literal(bits: u128, width: usize, signed: bool) -> Self {
+        Self {
+            signed_bits: extend_enum_bits(bits, width, signed),
+            unsigned_bits: bits,
+            width,
+            signed,
+            has_operator: false,
+            unsigned_width_limit: u128::BITS as usize,
+        }
+    }
+
+    fn bits_at(&self, width: usize) -> Option<u128> {
+        if !self.signed && width > self.unsigned_width_limit {
+            return None;
+        }
+        let bits = if self.signed { self.signed_bits } else { self.unsigned_bits };
+        Some(bits & enum_mask(width))
+    }
+
+    fn width_limit_in_unsigned_parent(&self) -> usize {
+        // VCS and Verilator can disagree when a signed operation is nested
+        // inside an unsigned expression. Keep only bits shared by both
+        // extensions of that subtree.
+        if self.signed && self.has_operator {
+            let difference = self.signed_bits ^ self.unsigned_bits;
+            self.unsigned_width_limit.min(difference.trailing_zeros() as usize)
+        } else {
+            self.unsigned_width_limit
+        }
+    }
+}
+
+fn enum_arithmetic(
+    db: &dyn WorkspaceSymbolIndexDb,
+    expr: OwnerRef<ExprId>,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<EnumArithmetic> {
+    let depth = depth.checked_sub(1)?;
+    *remaining = remaining.checked_sub(1)?;
+    let data = expr.cont_id.data(db);
+    let mut operand = |id| enum_arithmetic(db, expr.with_value(id), depth, remaining);
+    match data.expr(expr.value) {
+        Expr::Literal(Literal::Int(integer)) => {
+            let bits = enum_literal_bits(integer, integer.get_bit_width())?;
+            EnumArithmetic::from_bits(&bits, integer.is_signed())
+        }
+        Expr::Ident(_) | Expr::Field { .. } => enum_constant_operand(db, expr, depth, remaining),
+        Expr::Unary { op, expr } => {
+            let value = operand(*expr)?;
+            let apply = |bits: u128| match op {
+                UnaryOp::Pos => Some(bits),
+                UnaryOp::Neg => Some(bits.wrapping_neg()),
+                UnaryOp::BitNeg => Some(!bits),
+                _ => None,
+            };
+            Some(EnumArithmetic {
+                signed_bits: apply(value.signed_bits)?,
+                unsigned_bits: apply(value.unsigned_bits)?,
+                has_operator: true,
+                ..value
+            })
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let left = operand(*lhs)?;
+            let right = operand(*rhs)?;
+            let apply = |lhs: u128, rhs: u128| match op {
+                BinaryOp::Add => Some(lhs.wrapping_add(rhs)),
+                BinaryOp::Sub => Some(lhs.wrapping_sub(rhs)),
+                BinaryOp::Mul => Some(lhs.wrapping_mul(rhs)),
+                BinaryOp::BitAnd => Some(lhs & rhs),
+                BinaryOp::BitOr => Some(lhs | rhs),
+                BinaryOp::BitXor => Some(lhs ^ rhs),
+                BinaryOp::BitXnor => Some(!(lhs ^ rhs)),
+                _ => None,
+            };
+            let signed = left.signed && right.signed;
+            let unsigned_width_limit = if signed {
+                u128::BITS as usize
+            } else {
+                left.width_limit_in_unsigned_parent().min(right.width_limit_in_unsigned_parent())
+            };
+            Some(EnumArithmetic {
+                signed_bits: apply(left.signed_bits, right.signed_bits)?,
+                unsigned_bits: apply(left.unsigned_bits, right.unsigned_bits)?,
+                width: left.width.max(right.width),
+                signed,
+                has_operator: true,
+                unsigned_width_limit,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn enum_constant_operand(
+    db: &dyn WorkspaceSymbolIndexDb,
+    expr: OwnerRef<ExprId>,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<EnumArithmetic> {
+    let def = SemanticsImpl::new(db).expr_to_def(expr).unique()?;
+    let origin = def.declaration_origin(db);
+    // Package constants and their enum encodings do not vary by instance.
+    if origin.container_id(db).module_kind(db) != Some(ModuleKind::Package) {
+        return None;
+    }
+    if matches!(origin.loc(db), DefOriginLoc::EnumMember { .. }) {
+        let constant = trace_enum_value_at(db, def, depth, remaining)?;
+        return EnumArithmetic::from_bits(&constant.bits, constant.signed);
+    }
+    package_parameter_value(db, def, depth, remaining)
+}
+
+fn parameter_declarator(
+    db: &dyn WorkspaceSymbolIndexDb,
+    def: DefId,
+) -> Option<(OwnerRef<DeclId>, bool)> {
+    let origin = def.declaration_origin(db);
+    let decl = origin.as_decl(db)?;
+    let data = decl.cont_id.data(db);
+    let declarator = data.declarator(decl.value);
+    let DeclaratorParent::DeclarationId(parent) = declarator.parent else {
+        return None;
+    };
+    let Declaration::ParamDecl(param) = data.declaration(parent) else {
+        return None;
+    };
+    Some((decl, param.inferred_type))
+}
+
+fn package_parameter_value(
+    db: &dyn WorkspaceSymbolIndexDb,
+    def: DefId,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<EnumArithmetic> {
+    let (decl, inferred_type) = parameter_declarator(db, def)?;
+    let data = decl.cont_id.data(db);
+    let declarator = data.declarator(decl.value);
+    if !declarator.dimensions.is_empty() {
+        return None;
+    }
+    let initializer = declarator.initializer?;
+    if inferred_type && !matches!(data.expr(initializer), Expr::Literal(Literal::Int(_))) {
+        return None;
+    }
+    let value = enum_arithmetic(db, decl.with_value(initializer), depth, remaining)?;
+    if inferred_type {
+        return Some(value);
+    }
+    let types = TypeSystem::new(db);
+    let width = types.packed_integer_width_of_def(def)? as usize;
+    if !(1..=u128::BITS as usize).contains(&width) {
+        return None;
+    }
+    let signed = types.packed_signedness_of_def(def)?;
+    Some(EnumArithmetic::literal(value.bits_at(width)?, width, signed))
+}
+
+fn increment_enum_value(bits: String, signed: bool, offset: usize) -> Option<TraceEnumValue> {
+    let mut bits = bits.into_bytes();
+    // An offset spanning the entire base type necessarily crosses its maximum.
+    if bits.len() < usize::BITS as usize && offset >> bits.len() != 0 {
+        return None;
+    }
+    let was_negative = signed && bits[0] == b'1';
+    let mut carry = offset;
+    for bit in bits.iter_mut().rev() {
+        let add = (carry & 1) + usize::from(*bit == b'1');
+        *bit = if add & 1 == 0 { b'0' } else { b'1' };
+        carry = (carry >> 1) + (add >> 1);
+    }
+    let is_negative = signed && bits[0] == b'1';
+    if (carry != 0 && (!was_negative || is_negative)) || (!was_negative && is_negative) {
+        return None;
+    }
+    Some(TraceEnumValue { bits: String::from_utf8(bits).ok()?, signed })
 }
 
 fn trace_lexical_scope(db: &dyn WorkspaceSymbolIndexDb, def: DefId) -> Vec<String> {
@@ -778,6 +1280,16 @@ fn file_assignment_index(
         tree.root()
     };
     let mut index = FileAssignmentIndex::default();
+    let mut generate_sites = FxHashSet::default();
+    let mut record_generate_site = |node: SyntaxNode<'_>| {
+        let Some(range) = node.text_range() else { return };
+        generate_sites.insert((range.start(), None));
+        if let Some(token) = ast::GenerateBlock::cast(node).and_then(|block| block.name())
+            && let Some(label) = (SyntaxTokenWithParent { parent: node, tok: token }).text_range()
+        {
+            generate_sites.insert((label.start(), Some(range.start())));
+        }
+    };
     let mut nested_modules = 0usize;
     for event in root.elem_preorder() {
         if let WalkEvent::Leave(SyntaxElement::Node(node)) = event
@@ -795,6 +1307,20 @@ fn file_assignment_index(
         }
         if nested_modules != 0 {
             continue;
+        }
+        if let Some(condition) = ast::IfGenerate::cast(node) {
+            record_generate_site(condition.block().syntax());
+            if let Some(other) = condition.else_clause() {
+                record_generate_site(other.clause().syntax());
+            }
+        } else if let Some(case) = ast::CaseGenerate::cast(node) {
+            for clause in case.items().children().filter_map(generate_case_clause) {
+                record_generate_site(clause);
+            }
+        } else if let Some(generate) = ast::LoopGenerate::cast(node) {
+            record_generate_site(generate.block().syntax());
+        } else if ast::GenerateBlock::can_cast(node.kind()) {
+            record_generate_site(node);
         }
         let relation = if let Some(binary) = ast::BinaryExpression::cast(node)
             && access::assignment_operator(binary).is_some()
@@ -829,6 +1355,28 @@ fn file_assignment_index(
         if let Some(relation) = relation {
             db.unwind_if_revision_cancelled();
             index.insert(relation);
+        }
+    }
+    if index.assignments.iter().flat_map(|item| &item.generate_branches).any(|branch| {
+        branch.selected.iter().chain(&branch.alternatives).any(|label| label.name.is_empty())
+    }) {
+        let lines = utils::line_index::LineIndex::new(&db.file_text(file_id));
+        let mut counts = FxHashMap::<u32, usize>::default();
+        let line_at = |offset| lines.try_line_col(offset).map(|position| position.line);
+        for (offset, block_start) in generate_sites {
+            if let Some(line) = line_at(offset)
+                && block_start.and_then(line_at) != Some(line)
+            {
+                *counts.entry(line).or_default() += 1;
+            }
+        }
+        for branch in index.assignments.iter_mut().flat_map(|item| &mut item.generate_branches) {
+            for label in branch.selected.iter_mut().chain(&mut branch.alternatives) {
+                if label.name.is_empty() {
+                    label.unique_line = line_at(label.source.range.start())
+                        .and_then(|line| counts.get(&line)) == Some(&1);
+                }
+            }
         }
     }
     Some(Arc::new(index))
@@ -882,7 +1430,11 @@ fn index_task_inputs(
             hierarchical_targets: Vec::new(),
             inputs: Vec::new(),
             guards: Vec::new(),
-            generate_branches: enclosing_generate_branches(file_id, node),
+            case_entries: Vec::new(),
+            wait_entries: Vec::new(),
+            standalone_wait_entries: Vec::new(),
+            wait_predicates: Vec::new(),
+            generate_branches: enclosing_generate_branches(db, bindings, file_id, node),
             value: lower_value(db, bindings, file_id, expression),
             word_read: None,
             field_read: None,
@@ -892,6 +1444,8 @@ fn index_task_inputs(
             target_element_index: None,
             target_indexed_part: None,
             has_unresolved_operands: false,
+            delay_free_continuous: false,
+            initialization_at_start: false,
             unresolved_control_only: false,
             unresolved_effects: Vec::new(),
         };
@@ -916,9 +1470,78 @@ fn call_can_write(
     }
     let system_name = crate::signature_help::system_identifier_of(invocation.left());
     if let Some(name) = system_name.as_deref() {
-        return is_runtime_input(Some(name));
+        return is_runtime_input(Some(name)) || registered_system_call(db, file_id, name);
     }
     invocation.arguments().is_some() && access::dpi_writes_arguments(db, file_id, invocation)
+}
+
+fn registered_system_call(db: &dyn WorkspaceSymbolIndexDb, file_id: FileId, name: &str) -> bool {
+    db.project_config()
+        .explicit_inputs(db.file_compilation_profile(file_id))
+        .is_some_and(|inputs| inputs.external_system_calls.iter().any(|call| call == name))
+}
+
+fn plain_undelayed_continuous_target(db: &dyn WorkspaceSymbolIndexDb, target: DefId) -> bool {
+    let DefOriginLoc::Decl(decl) = target.declaration_origin(db).loc(db) else {
+        return false;
+    };
+    let body = decl.cont_id.data(db);
+    match body.declarator(decl.value).parent {
+        DeclaratorParent::DeclarationId(parent) => match body.declaration(parent) {
+            Declaration::NetDecl(net) => {
+                net.delay.is_none()
+                    && net.strength.is_none()
+                    && matches!(net.net_kind, Some(NetKind::Wire | NetKind::Tri | NetKind::Uwire))
+            }
+            Declaration::DataDecl(data) => {
+                !data.const_kw && TypeSystem::new(db).packed_signedness_of_def(target).is_some()
+            }
+            _ => false,
+        },
+        DeclaratorParent::PortDeclId(port) if matches!(&body.ports, Ports::Ansi(_)) => matches!(
+            &body.ports.get(port).header,
+            PortHeader::Net { dir: PortDirection::Output, net_ty }
+                if matches!(net_ty.kind, NetKind::Wire | NetKind::Tri | NetKind::Uwire)
+        ),
+        _ => false,
+    }
+}
+
+fn declaration_initializes_at_start(node: SyntaxNode<'_>) -> bool {
+    let Some(declaration) = ast::DataDeclaration::cast(node) else {
+        return false;
+    };
+    for modifier in declaration.modifiers().children() {
+        match modifier.kind() {
+            TokenKind::STATIC_KEYWORD => return true,
+            TokenKind::AUTOMATIC_KEYWORD => return false,
+            _ => {}
+        }
+    }
+    let mut current = node.parent();
+    while let Some(scope) = current {
+        if let Some(module) = ast::ModuleDeclaration::cast(scope) {
+            return !module
+                .header()
+                .lifetime()
+                .is_some_and(|lifetime| lifetime.kind() == TokenKind::AUTOMATIC_KEYWORD);
+        }
+        if !matches!(
+            scope.kind(),
+            SyntaxKind::GENERATE_REGION
+                | SyntaxKind::GENERATE_BLOCK
+                | SyntaxKind::IF_GENERATE
+                | SyntaxKind::CASE_GENERATE
+                | SyntaxKind::LOOP_GENERATE
+                | SyntaxKind::ELSE_CLAUSE
+                | SyntaxKind::STANDARD_CASE_ITEM
+                | SyntaxKind::DEFAULT_CASE_ITEM
+        ) {
+            return false;
+        }
+        current = scope.parent();
+    }
+    false
 }
 
 fn initializer_relation(
@@ -929,7 +1552,8 @@ fn initializer_relation(
 ) -> Option<AssignmentRelation> {
     let initializer = declaration.initializer()?;
     let node = declaration.syntax();
-    let kind = match node.parent()?.kind() {
+    let parent = node.parent()?;
+    let kind = match parent.kind() {
         SyntaxKind::NET_DECLARATION => AssignmentKind::Continuous,
         SyntaxKind::DATA_DECLARATION | SyntaxKind::FOR_VARIABLE_DECLARATION => {
             AssignmentKind::Initialization
@@ -951,7 +1575,11 @@ fn initializer_relation(
         hierarchical_targets: Vec::new(),
         inputs: Vec::new(),
         guards: Vec::new(),
-        generate_branches: enclosing_generate_branches(file_id, node),
+        case_entries: Vec::new(),
+        wait_entries: Vec::new(),
+        standalone_wait_entries: Vec::new(),
+        wait_predicates: Vec::new(),
+        generate_branches: enclosing_generate_branches(db, bindings, file_id, node),
         value: lower_value(db, bindings, file_id, initializer.expr()),
         word_read: lower_word_read(db, bindings, file_id, initializer.expr()),
         field_read: lower_field_read(db, bindings, file_id, initializer.expr()),
@@ -961,6 +1589,10 @@ fn initializer_relation(
         target_element_index: None,
         target_indexed_part: None,
         has_unresolved_operands: false,
+        delay_free_continuous: ast::NetDeclaration::cast(parent)
+            .is_some_and(|net| net.delay().is_none() && net.strength().is_none())
+            && plain_undelayed_continuous_target(db, target),
+        initialization_at_start: declaration_initializes_at_start(parent),
         unresolved_control_only: false,
         unresolved_effects: Vec::new(),
     };
@@ -972,7 +1604,9 @@ fn initializer_relation(
         false,
         &mut relation,
     );
-    collect_enclosing_controls(db, bindings, file_id, node, &mut relation);
+    if !relation.initialization_at_start {
+        collect_enclosing_controls(db, bindings, file_id, node, &mut relation);
+    }
     Some(relation)
 }
 
@@ -1022,7 +1656,11 @@ fn assignment_relation(
         hierarchical_targets: Vec::new(),
         inputs: Vec::new(),
         guards: Vec::new(),
-        generate_branches: enclosing_generate_branches(file_id, node),
+        case_entries: Vec::new(),
+        wait_entries: Vec::new(),
+        standalone_wait_entries: Vec::new(),
+        wait_predicates: Vec::new(),
+        generate_branches: enclosing_generate_branches(db, bindings, file_id, node),
         value: None,
         word_read: None,
         field_read: None,
@@ -1032,6 +1670,8 @@ fn assignment_relation(
         target_element_index: None,
         target_indexed_part: None,
         has_unresolved_operands: false,
+        delay_free_continuous: false,
+        initialization_at_start: false,
         unresolved_control_only: false,
         unresolved_effects: Vec::new(),
     };
@@ -1053,9 +1693,16 @@ fn assignment_relation(
         &mut relation,
     );
     collect_enclosing_controls(db, bindings, file_id, node, &mut relation);
-    if relation.targets.is_empty() {
+    if relation.targets.is_empty()
+        && !relation.unresolved_effects.iter().any(|effect| {
+            matches!(effect, TraceLimit::VirtualInterfaceBinding(_))
+        })
+    {
         return None;
     }
+    relation.delay_free_continuous = ast::ContinuousAssign::cast(parent)
+        .is_some_and(|assign| assign.delay().is_none() && assign.strength().is_none())
+        && matches!(relation.targets.as_slice(), [target] if plain_undelayed_continuous_target(db, *target));
     if access::assignment_operator(binary) == Some(ReferenceCategory::WRITE) {
         match lower_value(db, bindings, file_id, binary.left()) {
             Some(AssignmentValue::Signal(target) | AssignmentValue::ScopedSignal(target, _))
@@ -1203,7 +1850,11 @@ fn unresolved_effect_relation(
         hierarchical_targets: Vec::new(),
         inputs: Vec::new(),
         guards: Vec::new(),
-        generate_branches: enclosing_generate_branches(file_id, node),
+        case_entries: Vec::new(),
+        wait_entries: Vec::new(),
+        standalone_wait_entries: Vec::new(),
+        wait_predicates: Vec::new(),
+        generate_branches: enclosing_generate_branches(db, bindings, file_id, node),
         value: None,
         word_read: None,
         field_read: None,
@@ -1213,6 +1864,8 @@ fn unresolved_effect_relation(
         target_element_index: None,
         target_indexed_part: None,
         has_unresolved_operands: true,
+        delay_free_continuous: false,
+        initialization_at_start: false,
         unresolved_control_only: false,
         unresolved_effects: Vec::new(),
     };
@@ -1320,6 +1973,9 @@ fn lower_value_at_depth(
             let Name::IdentifierName(component) = name.right() else { return None };
             let token =
                 SyntaxTokenWithParent { parent: component.syntax(), tok: component.identifier()? };
+            if virtual_interface_access(db, file_id, token).is_some() {
+                return None;
+            }
             let (source, range) = resolve_source_range(db, file_id.into(), token.text_range()?)?;
             if source != file_id {
                 return None;
@@ -1378,12 +2034,12 @@ fn lower_value_at_depth(
                 "'1" => Some(AssignmentValue::FillBit(true)),
                 "'x" => Some(AssignmentValue::FillUnknown('x')),
                 "'z" => Some(AssignmentValue::FillUnknown('z')),
-                _ if token.kind() == TokenKind::INTEGER_LITERAL => integer_value(token.int()?),
+                _ if token.kind() == TokenKind::INTEGER_LITERAL => integer_value(&token.int()?),
                 _ => None,
             }
         }
         Expression::PrimaryExpression(PrimaryExpression::IntegerVectorExpression(literal)) => {
-            integer_value(literal.value()?.int()?)
+            integer_value(&literal.value()?.int()?)
         }
         Expression::PrimaryExpression(PrimaryExpression::ConcatenationExpression(concat)) => {
             Some(AssignmentValue::Concat(
@@ -1483,22 +2139,36 @@ fn lower_value_at_depth(
     }
 }
 
-fn integer_value(integer: syntax::value::SVInt) -> Option<AssignmentValue<DefId>> {
+fn integer_value(integer: &syntax::value::SVInt) -> Option<AssignmentValue<DefId>> {
     let width = integer.get_bit_width();
     if !(1..=4096).contains(&width) {
         return None;
     }
-    let bits = integer.serialize(2).to_ascii_lowercase();
-    if !bits.bytes().all(|bit| matches!(bit, b'0' | b'1' | b'x' | b'z'))
-        || bits.is_empty()
-        || bits.len() > width
+    let serialized = integer.serialize(2).to_ascii_lowercase();
+    let negative = serialized.strip_prefix('-');
+    let magnitude = negative.unwrap_or(&serialized);
+    if magnitude.is_empty()
+        || magnitude.len() > width
+        || !magnitude.bytes().all(|bit| matches!(bit, b'0' | b'1' | b'x' | b'z'))
     {
         return None;
     }
-    let first = bits.as_bytes()[0];
-    let pad = if matches!(first, b'x' | b'z') { first as char } else { '0' };
-    let bits = pad.to_string().repeat(width - bits.len()) + &bits;
-    Some(AssignmentValue::Literal(bits, integer.is_signed()))
+    let first = magnitude.as_bytes()[0];
+    let pad = if matches!(first, b'x' | b'z') { first } else { b'0' };
+    let mut bits = vec![pad; width - magnitude.len()];
+    bits.extend_from_slice(magnitude.as_bytes());
+    if negative.is_some() {
+        if !integer.is_signed() || integer.has_unknown() {
+            return None;
+        }
+        // Slang formats a signed negative as minus and magnitude. Its two's
+        // complement keeps the low set bit and flips all more significant bits.
+        let low_set = bits.iter().rposition(|&bit| bit == b'1')?;
+        for bit in &mut bits[..low_set] {
+            *bit = if *bit == b'0' { b'1' } else { b'0' };
+        }
+    }
+    Some(AssignmentValue::Literal(String::from_utf8(bits).ok()?, integer.is_signed()))
 }
 
 fn lower_select<'a>(
@@ -1561,15 +2231,74 @@ fn lower_packed_selector<'a>(
     (left.abs_diff(right) < 4096).then_some(AssignmentValue::Select(def, left, right))
 }
 
-fn enclosing_generate_branches(file_id: FileId, mut child: SyntaxNode<'_>) -> Vec<GenerateBranch> {
+fn generate_case_clause(item: ast::CaseItem<'_>) -> Option<SyntaxNode<'_>> {
+    match item {
+        ast::CaseItem::StandardCaseItem(item) => Some(item.clause().syntax()),
+        ast::CaseItem::DefaultCaseItem(item) => Some(item.clause().syntax()),
+        ast::CaseItem::PatternCaseItem(_) => None,
+    }
+}
+
+fn generate_case_match(
+    db: &dyn WorkspaceSymbolIndexDb,
+    bindings: &GenericInterfaceTypes,
+    file_id: FileId,
+    case: ast::CaseGenerate<'_>,
+) -> Option<GenerateCaseMatch> {
+    let lower = |expression| {
+        let value = lower_value_at_depth(db, bindings, file_id, expression, 0, true)?;
+        let supported = match &value {
+            AssignmentValue::Literal(..) | AssignmentValue::GenerateIndex(_) => true,
+            AssignmentValue::Unary(ValueUnary::Negate, operand) => {
+                matches!(operand.as_ref(), AssignmentValue::Literal(..))
+            }
+            _ => false,
+        };
+        if !supported {
+            return None;
+        }
+        value.try_map(&|_| None)
+    };
+    let selector = lower(case.condition())?;
+    let mut labels = Vec::new();
+    for item in case.items().children() {
+        let ast::CaseItem::StandardCaseItem(item) = item else {
+            return None;
+        };
+        let mut expressions = item.expressions().children().peekable();
+        expressions.peek()?;
+        for expression in expressions {
+            if labels.len() == 32 {
+                return None;
+            }
+            labels.push(lower(expression)?);
+        }
+    }
+    (!labels.is_empty()).then_some(GenerateCaseMatch { selector, labels })
+}
+
+fn enclosing_generate_branches(
+    db: &dyn WorkspaceSymbolIndexDb,
+    bindings: &GenericInterfaceTypes,
+    file_id: FileId,
+    mut child: SyntaxNode<'_>,
+) -> Vec<GenerateBranch> {
     let label = |node| {
-        let token = ast::GenerateBlock::cast(node)?.name()?;
+        let name = ast::GenerateBlock::cast(node).and_then(|block| block.name());
+        let block = node.text_range();
+        let (name, range) = if let Some(token) = name {
+            (
+                token.raw_text().trim().trim_start_matches('\\').to_owned(),
+                SyntaxTokenWithParent { parent: node, tok: token }.text_range()?,
+            )
+        } else {
+            (String::new(), block?)
+        };
         Some(GenerateLabel {
-            name: token.raw_text().trim().trim_start_matches('\\').to_owned(),
-            source: FileRange {
-                file_id,
-                range: SyntaxTokenWithParent { parent: node, tok: token }.text_range()?,
-            },
+            name,
+            source: FileRange { file_id, range },
+            block_end: block.map(|range| range.end()),
+            unique_line: false,
         })
     };
     let mut branches: Vec<GenerateBranch> = Vec::new();
@@ -1579,29 +2308,33 @@ fn enclosing_generate_branches(file_id: FileId, mut child: SyntaxNode<'_>) -> Ve
         }
         if let Some(condition) = ast::IfGenerate::cast(ancestor) {
             let first = label(condition.block().syntax());
-            let second = condition.else_clause().and_then(|part| label(part.clause().syntax()));
+            let otherwise = condition.else_clause();
+            let second = otherwise.and_then(|part| label(part.clause().syntax()));
+            let in_first = child == condition.block().syntax();
             let (selected, alternative) =
-                if child == condition.block().syntax() { (first, second) } else { (second, first) };
+                if in_first { (first, second) } else { (second, first) };
             branches.push(GenerateBranch {
                 selected,
                 alternatives: alternative.into_iter().collect(),
+                lone_if_condition: (in_first && otherwise.is_none()).then(|| {
+                    lower_value_at_depth(db, bindings, file_id, condition.condition(), 0, true)?
+                        .try_map(&|_| None)
+                }).flatten(),
                 ..GenerateBranch::default()
             });
         }
         if let Some(case) = ast::CaseGenerate::cast(ancestor) {
             let mut branch = GenerateBranch::default();
             for item in case.items().children() {
-                let site = match item {
-                    ast::CaseItem::StandardCaseItem(item) => label(item.clause().syntax()),
-                    ast::CaseItem::DefaultCaseItem(item) => label(item.clause().syntax()),
-                    ast::CaseItem::PatternCaseItem(_) => None,
-                };
-                if item.syntax() == child {
+                let syntax = item.syntax();
+                let site = generate_case_clause(item).and_then(label);
+                if syntax == child {
                     branch.selected = site;
                 } else {
                     branch.alternatives.extend(site);
                 }
             }
+            branch.case_without_default = generate_case_match(db, bindings, file_id, case);
             branches.push(branch);
         }
         if let Some(generate) = ast::LoopGenerate::cast(ancestor) {
@@ -1620,6 +2353,47 @@ fn enclosing_generate_branches(file_id: FileId, mut child: SyntaxNode<'_>) -> Ve
     branches
 }
 
+fn can_sample_wait(condition: ast::Expression<'_>, depth: usize) -> bool {
+    if depth >= 32 {
+        return false;
+    }
+    use ast::{Expression, Name, PrimaryExpression};
+    match condition {
+        Expression::Name(Name::IdentifierName(_)) => true,
+        Expression::PrimaryExpression(PrimaryExpression::ParenthesizedExpression(inner)) => {
+            can_sample_wait(inner.expression(), depth + 1)
+        }
+        Expression::PrimaryExpression(PrimaryExpression::LiteralExpression(literal)) => {
+            literal.literal().is_some_and(|token| {
+                token.kind() == TokenKind::INTEGER_LITERAL
+                    || matches!(token.raw_text().to_ascii_lowercase().as_str(), "'0" | "'1" | "'x" | "'z")
+            })
+        }
+        Expression::PrimaryExpression(PrimaryExpression::IntegerVectorExpression(_)) => true,
+        Expression::PrefixUnaryExpression(unary) => {
+            unary.operator_token().is_some_and(|token| {
+                matches!(token.kind(), TokenKind::EXCLAMATION | TokenKind::TILDE)
+            })
+                && can_sample_wait(unary.operand(), depth + 1)
+        }
+        Expression::BinaryExpression(binary) => {
+            binary.operator_token().is_some_and(|token| {
+                matches!(
+                    token.kind(),
+                    TokenKind::DOUBLE_AND | TokenKind::DOUBLE_OR |
+                    TokenKind::AND | TokenKind::OR | TokenKind::XOR |
+                    TokenKind::DOUBLE_EQUALS | TokenKind::EXCLAMATION_EQUALS |
+                    TokenKind::TRIPLE_EQUALS | TokenKind::EXCLAMATION_DOUBLE_EQUALS |
+                    TokenKind::LESS_THAN | TokenKind::LESS_THAN_EQUALS |
+                    TokenKind::GREATER_THAN | TokenKind::GREATER_THAN_EQUALS
+                )
+            }) && can_sample_wait(binary.left(), depth + 1)
+                && can_sample_wait(binary.right(), depth + 1)
+        }
+        _ => false,
+    }
+}
+
 fn collect_enclosing_controls(
     db: &dyn WorkspaceSymbolIndexDb,
     bindings: &GenericInterfaceTypes,
@@ -1628,6 +2402,7 @@ fn collect_enclosing_controls(
     relation: &mut AssignmentRelation,
 ) {
     let unresolved_data = relation.has_unresolved_operands;
+    let assignment = child.text_range();
     while let Some(ancestor) = child.parent() {
         if matches!(
             ancestor.kind(),
@@ -1664,6 +2439,26 @@ fn collect_enclosing_controls(
         if let Some(case) = ast::CaseStatement::cast(ancestor) {
             collect_case_controls(db, bindings, file_id, case, child, relation);
         }
+        if let Some(assignment) = assignment
+            && ancestor.kind() == SyntaxKind::SEQUENTIAL_BLOCK_STATEMENT
+            && let Some(block) = ast::BlockStatement::cast(ancestor)
+            && let Some(condition) = preceding_standalone_wait(block, assignment)
+        {
+            relation.has_unresolved_operands = true;
+            collect_operands(db, bindings, file_id, condition.syntax(), AssignmentInputKind::Control, false, relation);
+            if let Some((source, range)) = condition.syntax().text_range()
+                .and_then(|range| resolve_source_range(db, file_id.into(), range))
+            {
+                let location = FileRange { file_id: source, range };
+                relation.unresolved_effects.push(TraceLimit::ProceduralTiming(location));
+                if can_sample_wait(condition, 0) {
+                    relation.standalone_wait_entries.push(location);
+                    if let Some(predicate) = lower_guard(db, bindings, file_id, condition, 0) {
+                        relation.wait_predicates.push((location, predicate));
+                    }
+                }
+            }
+        }
         if let Some(condition) = procedural_loop_condition(ancestor, child) {
             relation.has_unresolved_operands = true;
             if let Some(condition) = condition {
@@ -1696,6 +2491,16 @@ fn collect_enclosing_controls(
             collect_operands(db, bindings, file_id, condition, AssignmentInputKind::Control, false, relation);
         }
         let unresolved_timing = if let Some(wait) = ast::WaitStatement::cast(ancestor) {
+            if can_sample_wait(wait.expr(), 0)
+                && let Some((source, range)) = wait.expr().syntax().text_range()
+                    .and_then(|range| resolve_source_range(db, file_id.into(), range))
+            {
+                let location = FileRange { file_id: source, range };
+                relation.wait_entries.push(location);
+                if let Some(predicate) = lower_guard(db, bindings, file_id, wait.expr(), 0) {
+                    relation.wait_predicates.push((location, predicate));
+                }
+            }
             Some(wait.expr().syntax())
         } else if let Some(timing) = ast::TimingControlStatement::cast(ancestor) {
             let control = timing.timing_control();
@@ -1726,6 +2531,34 @@ fn collect_enclosing_controls(
     }
     relation.guards.reverse();
     relation.unresolved_control_only = !unresolved_data && relation.has_unresolved_operands;
+}
+
+fn preceding_standalone_wait<'a>(
+    block: ast::BlockStatement<'a>,
+    assignment: utils::line_index::TextRange,
+) -> Option<ast::Expression<'a>> {
+    let mut preceding = None;
+    for item in block.items().children() {
+        let node = item.syntax();
+        if let Some(range) = node.text_range()
+            && range.start() <= assignment.start()
+            && range.end() >= assignment.end()
+        {
+            return (node.kind() == SyntaxKind::EXPRESSION_STATEMENT)
+                .then_some(preceding).flatten();
+        }
+        if let Some(wait) = ast::WaitStatement::cast(node)
+            && wait.statement().syntax().kind() == SyntaxKind::EMPTY_STATEMENT
+        {
+            preceding = Some(wait.expr());
+        } else if !ast::TimingControlStatement::cast(node).is_some_and(|timing| {
+            timing.statement().syntax().kind() == SyntaxKind::EMPTY_STATEMENT
+                && timing.timing_control().syntax().kind() == SyntaxKind::DELAY_CONTROL
+        }) {
+            preceding = None;
+        }
+    }
+    None
 }
 
 fn procedural_loop_condition<'a>(
@@ -1762,42 +2595,90 @@ fn collect_case_controls<'a>(
     child: SyntaxNode<'a>,
     relation: &mut AssignmentRelation,
 ) {
-    let selector =
-        case.case_keyword().filter(|_| case.matches_or_inside().is_none()).and_then(|keyword| {
-            let op = match keyword.kind() {
-                TokenKind::CASE_KEYWORD => ValueBinary::CaseItemEqual,
-                TokenKind::CASE_Z_KEYWORD => ValueBinary::CaseItemZ,
-                TokenKind::CASE_X_KEYWORD => ValueBinary::CaseItemX,
-                _ => return None,
-            };
-            Some((op, lower_value(db, bindings, file_id, case.expr())?))
-        });
+    let kind = match (case.case_keyword().map(|token| token.kind()), case.matches_or_inside()) {
+        (Some(TokenKind::CASE_KEYWORD), Some(token))
+            if token.kind() == TokenKind::INSIDE_KEYWORD =>
+        {
+            Some(CaseMatchKind::Inside)
+        }
+        (Some(TokenKind::CASE_KEYWORD), None) => Some(CaseMatchKind::Equal),
+        (Some(TokenKind::CASE_Z_KEYWORD), None) => Some(CaseMatchKind::WildcardZ),
+        (Some(TokenKind::CASE_X_KEYWORD), None) => Some(CaseMatchKind::WildcardX),
+        _ => None,
+    };
+    let case_match = kind.and_then(|kind| {
+        let (selector, labels) = lower_case_labels(db, bindings, file_id, case, kind)?;
+        Some((selector, labels, kind))
+    });
     let collect = |expr: SyntaxNode<'_>, relation: &mut AssignmentRelation| {
         collect_operands(db, bindings, file_id, expr, AssignmentInputKind::Control, false, relation);
     };
     collect(case.expr().syntax(), relation);
     let default_branch = child.kind() == SyntaxKind::DEFAULT_CASE_ITEM;
+    if let Some((AssignmentValue::Signal(_), labels, _)) = &case_match
+        && labels.iter().flatten().all(|term| matches!(
+            term,
+            AssignmentValue::Signal(_) | AssignmentValue::Literal(..) |
+            AssignmentValue::UnsignedBit(_) | AssignmentValue::FillBit(_) |
+            AssignmentValue::FillUnknown(_)
+        ))
+        && let Some(arm) = ast::CaseItem::cast(child)
+        && let Some(body) = generate_case_clause(arm)
+        && !ast::BlockStatement::cast(body).is_some_and(|block| {
+            body.kind() != SyntaxKind::SEQUENTIAL_BLOCK_STATEMENT ||
+                block.items().children().any(|item| ast::Statement::cast(item.syntax()).is_none())
+        })
+    {
+        let location = |node: SyntaxNode<'_>| {
+            let (file_id, range) = resolve_source_range(db, file_id.into(), node.text_range()?)?;
+            Some(FileRange { file_id, range })
+        };
+        if let (Some(selector), Some(body)) = (location(case.expr().syntax()), location(body))
+            && selector.file_id == body.file_id
+        {
+            relation.case_entries.push(CaseEntry { selector, body, default_branch });
+        }
+    }
     let guard_start = relation.guards.len();
-    relation.has_unresolved_operands |= selector.is_none();
+    relation.has_unresolved_operands |= case_match.is_none();
+    let mut label_offset = 0;
     for item in case.items().children() {
         match item {
             ast::CaseItem::StandardCaseItem(item) => {
+                let first_label = label_offset;
                 for expression in item.expressions().children() {
                     collect(expression.syntax(), relation);
+                    label_offset += 1;
                 }
-                let guard = selector
-                    .as_ref()
-                    .filter(|_| relation.guards.len() - guard_start < 32)
-                    .and_then(|(op, selector)| {
-                        lower_case_item_guard(
-                            db, bindings,
-                            file_id,
-                            *op,
-                            selector,
-                            item,
-                            item.syntax() == child,
-                        )
-                    });
+                let selected = item.syntax() == child;
+                let guard = case_match.as_ref().and_then(|(selector, labels, kind)| {
+                    let location = case_item_location(db, file_id, item)?;
+                    let mut terms = labels.clone();
+                    // Later labels set width and signedness without being evaluated.
+                    for value in terms.iter_mut().skip(label_offset).flatten() {
+                        if let AssignmentValue::Signal(def) = *value {
+                            let types = TypeSystem::new(db);
+                            if let (Some([left, right]), Some(signed)) = (
+                                types.literal_packed_range_of_def(def),
+                                types.packed_signedness_of_def(def),
+                            ) && let Some(width) = left.abs_diff(right).checked_add(1)
+                                && width <= 4096
+                            {
+                                *value = AssignmentValue::TypeShape(width, signed);
+                            }
+                        }
+                    }
+                    Some(AssignmentGuard {
+                        location,
+                        taken_when_true: selected,
+                        expression: Some(GuardExpression::Value(AssignmentValue::CaseMatch(
+                            Box::new(selector.clone()),
+                            terms,
+                            [first_label, label_offset],
+                            *kind,
+                        ))),
+                    })
+                });
                 if let Some(guard) = guard {
                     relation.guards.push(guard);
                 } else {
@@ -1820,40 +2701,50 @@ fn collect_case_controls<'a>(
     relation.guards[guard_start..].reverse();
 }
 
-fn lower_case_item_guard(
+fn lower_case_labels(
     db: &dyn WorkspaceSymbolIndexDb,
     bindings: &GenericInterfaceTypes,
     file_id: FileId,
-    op: ValueBinary,
-    selector: &AssignmentValue<DefId>,
-    item: ast::StandardCaseItem<'_>,
-    taken_when_true: bool,
-) -> Option<AssignmentGuard> {
-    let first_label = item.expressions().children().next()?;
-    let (source_file, range) =
-        resolve_source_range(db, file_id.into(), first_label.syntax().text_range()?)?;
-    let comparisons = item
-        .expressions()
-        .children()
-        .take(33)
-        .map(|label| {
-            Some(GuardExpression::Value(AssignmentValue::Binary(
-                op,
-                Box::new(selector.clone()),
-                Box::new(lower_value(db, bindings, file_id, label)?),
-            )))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if comparisons.len() > 32 {
-        return None;
+    case: ast::CaseStatement<'_>,
+    kind: CaseMatchKind,
+) -> Option<(AssignmentValue<DefId>, Vec<Vec<AssignmentValue<DefId>>>)> {
+    const MAX_LABELS: usize = 128;
+    let selector = lower_value(db, bindings, file_id, case.expr())?;
+    let mut labels = Vec::new();
+    for item in case.items().children() {
+        let expressions = match item {
+            ast::CaseItem::StandardCaseItem(item) => item.expressions(),
+            ast::CaseItem::DefaultCaseItem(_) => continue,
+            ast::CaseItem::PatternCaseItem(_) => return None,
+        };
+        for expression in expressions.children() {
+            if labels.len() == MAX_LABELS {
+                return None;
+            }
+            let lower = |expr| lower_value(db, bindings, file_id, expr);
+            let label = if let Some(range) = ast::ValueRangeExpression::cast(expression.syntax()) {
+                if kind != CaseMatchKind::Inside || range.op()?.kind() != TokenKind::COLON {
+                    return None;
+                }
+                vec![lower(range.left())?, lower(range.right())?]
+            } else {
+                vec![lower(expression)?]
+            };
+            labels.push(label);
+        }
     }
-    Some(AssignmentGuard {
-        location: FileRange { file_id: source_file, range },
-        expression: comparisons
-            .into_iter()
-            .reduce(|left, right| GuardExpression::Or(Box::new(left), Box::new(right))),
-        taken_when_true,
-    })
+    Some((selector, labels))
+}
+
+fn case_item_location(
+    db: &dyn WorkspaceSymbolIndexDb,
+    file_id: FileId,
+    item: ast::StandardCaseItem<'_>,
+) -> Option<FileRange> {
+    let first_label = item.expressions().children().next()?;
+    let (file_id, range) =
+        resolve_source_range(db, file_id.into(), first_label.syntax().text_range()?)?;
+    Some(FileRange { file_id, range })
 }
 
 fn guard_expression(
@@ -2136,6 +3027,29 @@ fn collect_operands(
     relation: &mut AssignmentRelation,
 ) {
     let hir_file = file_id.into();
+    let external_call = ast::InvocationExpression::cast(root).filter(|invocation| {
+        collect_targets
+            && crate::signature_help::system_identifier_of(invocation.left())
+                .is_some_and(|name| registered_system_call(db, file_id, &name))
+    });
+    let classify = |signal: DefId, token: SyntaxTokenWithParent<'_>| {
+        let mut category = access::classify(db, file_id, signal, token, &ReferenceContext::Plain);
+        if let Some(call) = external_call
+            && matches!(
+                signal.kind(db),
+                hir_def::symbol::DefKind::Net
+                    | hir_def::symbol::DefKind::Variable
+                    | hir_def::symbol::DefKind::Port
+                    | hir_def::symbol::DefKind::NonAnsiPort
+                    | hir_def::symbol::DefKind::SubroutinePort
+                    | hir_def::symbol::DefKind::StructMember
+            )
+            && access::is_direct_call_argument(token, call)
+        {
+            category |= ReferenceCategory::READ | ReferenceCategory::WRITE;
+        }
+        category
+    };
     for event in root.elem_preorder() {
         if let WalkEvent::Enter(SyntaxElement::Node(node)) = event
             && increment_operand(node).is_some()
@@ -2199,7 +3113,7 @@ fn collect_operands(
                 continue;
             };
             let location = FileRange { file_id, range };
-            let category = access::classify(db, file_id, parts[0].0, token, &ReferenceContext::Plain);
+            let category = classify(parts[0].0, token);
             let count = parts.len() as u32;
             for (component, (signal, range)) in parts.into_iter().enumerate() {
                 let mut operand = operand.clone();
@@ -2210,12 +3124,15 @@ fn collect_operands(
                         relation.targets.push(signal);
                     }
                     relation.hierarchical_targets.push(HierarchicalTarget {
-                        signal, location, interface_operand: Some(operand.clone()),
+                        signal, location, hierarchical_path: None, hierarchical_indices: Vec::new(),
+                        interface_operand: Some(operand.clone()),
                     });
                 }
                 if category.contains(ReferenceCategory::READ) {
                     relation.inputs.push(AssignmentInput {
-                        signal, kind, location, hierarchical: true, interface_operand: Some(operand),
+                        signal, kind, location, hierarchical: true, hierarchical_path: None,
+                        hierarchical_indices: Vec::new(),
+                        interface_operand: Some(operand),
                     });
                 }
             }
@@ -2236,23 +3153,28 @@ fn collect_operands(
         if signal.interface_port(db).is_some() {
             continue;
         }
-        let category = access::classify(db, file_id, signal, token, &ReferenceContext::Plain);
+        let category = classify(signal, token);
         let writes_target = collect_targets
             && category.contains(ReferenceCategory::WRITE)
             && !syntax::SyntaxAncestors::start_from(token.parent)
                 .take_while(|ancestor| *ancestor != root)
                 .any(|ancestor| increment_operand(ancestor).is_some());
-        let hierarchical = signal.kind(db) != hir_def::symbol::DefKind::StructMember
-            && token.parent.parent().and_then(ast::ScopedName::cast).is_some_and(|name| {
-                name.right().syntax() == token.parent
-                    && name.separator().is_some_and(|part| part.kind() == TokenKind::DOT)
-            });
+        let scoped = token.parent.parent().and_then(ast::ScopedName::cast).filter(|name| {
+            signal.kind(db) != hir_def::symbol::DefKind::StructMember
+                && name.right().syntax() == token.parent
+                && name.separator().is_some_and(|part| part.kind() == TokenKind::DOT)
+        });
+        let hierarchical = scoped.is_some();
         let location = || {
             let (file_id, range) = resolve_source_range(db, hir_file, token.text_range()?)?;
             Some(FileRange { file_id, range })
         };
         let interface_operand =
             hierarchical.then(|| interface_operand(db, bindings, file_id, token)).flatten();
+        let (hierarchical_path, hierarchical_indices) = scoped
+            .filter(|_| interface_operand.is_none())
+            .and_then(|name| hierarchical_scopes(db, bindings, file_id, name.left()))
+            .map_or_else(|| (None, Vec::new()), |(path, indices)| (Some(path), indices));
         if writes_target
             && hierarchical
             && let Some(location) = location()
@@ -2260,6 +3182,8 @@ fn collect_operands(
             relation.hierarchical_targets.push(HierarchicalTarget {
                 signal,
                 location,
+                hierarchical_path: hierarchical_path.clone(),
+                hierarchical_indices: hierarchical_indices.clone(),
                 interface_operand: interface_operand.clone(),
             });
         }
@@ -2274,10 +3198,64 @@ fn collect_operands(
                 kind,
                 location,
                 hierarchical,
+                hierarchical_path,
+                hierarchical_indices,
                 interface_operand,
             });
         }
     }
+}
+
+fn hierarchical_scopes(
+    db: &dyn WorkspaceSymbolIndexDb,
+    bindings: &GenericInterfaceTypes,
+    file_id: FileId,
+    mut name: ast::Name<'_>,
+) -> Option<(Vec<String>, Vec<(usize, AssignmentValue<DefId>)>)> {
+    let segment = |name: ast::Name<'_>| -> Option<(String, Option<AssignmentValue<DefId>>)> {
+        match name {
+            ast::Name::IdentifierName(name) => {
+                Some((hir_def::lower_ident_opt(name.identifier())?.as_str().to_owned(), None))
+            }
+            ast::Name::IdentifierSelectName(name) => {
+                let mut selectors = name.selectors().children();
+                let ast::Selector::BitSelect(index) = selectors.next()?.selector()? else {
+                    return None;
+                };
+                if selectors.next().is_some() {
+                    return None;
+                }
+                let ident = hir_def::lower_ident_opt(name.identifier())?;
+                let index = index.expr();
+                if let Some(value) = interface_array_index(index) {
+                    return Some((format!("{}[{value}]", ident.as_str()), None));
+                }
+                let expression = lower_value_at_depth(db, bindings, file_id, index, 0, true)?
+                    .try_map(&|def| (def.kind(db) == hir_def::symbol::DefKind::Param).then_some(def))?;
+                Some((format!("{}[?]", ident.as_str()), Some(expression)))
+            }
+            _ => None,
+        }
+    };
+
+    let mut scopes = Vec::new();
+    while let ast::Name::ScopedName(scoped) = name {
+        if scopes.len() >= 63 || scoped.separator()?.kind() != TokenKind::DOT {
+            return None;
+        }
+        scopes.push(segment(scoped.right())?);
+        name = scoped.left();
+    }
+    scopes.push(segment(name)?);
+    let mut path = Vec::new();
+    let mut indices = Vec::new();
+    for (position, (name, expression)) in scopes.into_iter().rev().enumerate() {
+        path.push(name);
+        if let Some(expression) = expression {
+            indices.push((position, expression));
+        }
+    }
+    Some((path, indices))
 }
 
 fn virtual_interface_access<'a>(
@@ -2287,7 +3265,9 @@ fn virtual_interface_access<'a>(
 ) -> Option<ast::ScopedName<'a>> {
     use hir_def::expr::data_ty::DataTy;
     let name = token.parent.parent().and_then(ast::ScopedName::cast)?;
-    if name.right().syntax() != token.parent || name.separator()?.kind() != TokenKind::DOT {
+    if name.separator()?.kind() != TokenKind::DOT
+        || (name.left().syntax() != token.parent && name.right().syntax() != token.parent)
+    {
         return None;
     }
     let ast::Name::IdentifierName(handle) = name.left() else {
@@ -2358,6 +3338,8 @@ fn collect_subroutine_reads(
                 kind,
                 location,
                 hierarchical: false,
+                hierarchical_path: None,
+                hierarchical_indices: Vec::new(),
                 interface_operand: None,
             })
         }));
@@ -2424,7 +3406,237 @@ fn local_subroutine_access(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{position, setup_marked_with_path};
+    use crate::test_utils::{position, setup_marked_with_path, strip_markers};
+
+    #[test]
+    fn traces_literal_packed_bounds_without_inventing_instance_widths() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+module tb #(parameter WIDTH = 4)(output wire [2:-1] /*marker:q*/q);
+    wire [-1:2] ascending;
+    wire [WIDTH-1:0] parameterized;
+    assign q = ascending ^ parameterized;
+endmodule
+"#,
+            "/packed_bounds.sv",
+        );
+        let trace = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "q"),
+            TraceDirection::Drivers,
+            TraceBudget { max_depth: 2, max_signals: 8, max_assignments: 8 },
+        ).unwrap().unwrap();
+        let range = |name| trace.signals.iter().find(|signal| signal.name == name).unwrap().packed_range;
+        assert_eq!(range("q"), Some([2, -1]));
+        assert_eq!(range("ascending"), Some([-1, 2]));
+        assert_eq!(range("parameterized"), None);
+    }
+
+    #[test]
+    fn exposes_resolved_package_parameters_as_trace_operands() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+package ops;
+    parameter MODE = 2'b10;
+    localparam logic [2:0] MASK = MODE + 2'd3;
+    parameter UNSUPPORTED = 8'd6 / 8'd2;
+endpackage
+module dut #(parameter OVERRIDABLE = 1'b0)(output wire [5:0] /*marker:q*/q);
+    import ops::*;
+    assign q = {MODE, ops::MASK, OVERRIDABLE} ^ UNSUPPORTED;
+endmodule
+"#,
+            "/package_parameters.sv",
+        );
+        let trace = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "q"),
+            TraceDirection::Drivers,
+            TraceBudget { max_depth: 8, max_signals: 32, max_assignments: 32 },
+        ).unwrap().unwrap();
+        let find = |name| trace.signals.iter().find(|signal| signal.name == name).unwrap();
+        for (name, bits) in [("MODE", "10"), ("MASK", "101")] {
+            let parameter = find(name);
+            assert_eq!(parameter.package_parameter_value, Some(TraceEnumValue {
+                bits: bits.into(), signed: false,
+            }));
+            assert!(parameter.declaration.is_some());
+        }
+        assert_eq!(find("UNSUPPORTED").package_parameter_value_unavailable, Some(true));
+        assert_eq!(find("OVERRIDABLE").package_parameter_value, None);
+        assert_eq!(find("OVERRIDABLE").package_parameter_value_unavailable, None);
+        assert_eq!(find("OVERRIDABLE").instance_parameter, Some(true));
+        assert_eq!(find("MODE").instance_parameter, None);
+    }
+
+    #[test]
+    fn traces_literal_package_enum_values_with_the_base_type() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+package ops;
+    parameter WIDTH = 7;
+    typedef enum logic [WIDTH-1:0] {
+        OP_ZERO, OP_ONE, OP_AND = 7'b0010101, OP_NEXT, OP_EXPR = 7'd17 + 7'd2,
+        OP_AFTER_EXPR, OP_UNRESOLVED = 7'd70 / 7'd2, OP_AFTER_UNRESOLVED,
+        OP_RESTART = 7'd31, OP_AFTER_RESTART, OP_MIXED = 8'd44 + 7'd2, OP_AFTER_MIXED,
+        OP_MASKED = ((7'd3 * 7'd9) - 7'd3) & ~7'h40, OP_AFTER_MASKED
+    } opcode_t;
+    typedef enum logic signed [3:0] {
+        NEG_BASE = -(8'sd1 + 3'sd1), NEG_NEXT, SIGNED_ZERO
+    } signed_opcode_t;
+    typedef enum logic [7:0] {
+        MIXED_SIGN = (4'shf + 3'sd2) + 8'd1, MIXED_SIGN_NEXT,
+        DIRECT_MIX = 4'shf + 8'd2, DIRECT_MIX_NEXT,
+        POSITIVE_MIX = (4'sd2 + 3'sd1) + 8'd4
+    } mixed_sign_t;
+    typedef enum logic signed [67:0] {
+        WIDE_BASE = 68'shffffffffffffffffe, WIDE_NEXT
+    } wide_opcode_t;
+endpackage
+module dut(input wire [6:0] op, input wire signed [67:0] wide, output wire /*marker:q*/q);
+    import ops::*;
+    assign q = op == OP_ZERO || op == OP_ONE || op == OP_AND || op == OP_NEXT ||
+        op == OP_EXPR || op == OP_AFTER_EXPR || op == OP_AFTER_RESTART ||
+        op == OP_UNRESOLVED || op == OP_AFTER_UNRESOLVED ||
+        op == OP_MIXED || op == OP_AFTER_MIXED ||
+        op == OP_MASKED || op == OP_AFTER_MASKED ||
+        op == NEG_BASE || op == NEG_NEXT || op == SIGNED_ZERO ||
+        op == MIXED_SIGN || op == MIXED_SIGN_NEXT || op == DIRECT_MIX ||
+        op == DIRECT_MIX_NEXT || op == POSITIVE_MIX ||
+        wide == WIDE_BASE || wide == WIDE_NEXT;
+endmodule
+"#,
+            "/literal_enum.sv",
+        );
+        let trace = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "q"),
+            TraceDirection::Drivers,
+            TraceBudget { max_depth: 8, max_signals: 32, max_assignments: 32 },
+        ).unwrap().unwrap();
+        let find = |name| trace.signals.iter().find(|signal| signal.name == name).unwrap();
+        assert_eq!(find("OP_AND").enum_value, Some(TraceEnumValue {
+            bits: "0010101".into(), signed: false,
+        }));
+        assert_eq!(find("OP_ZERO").enum_value.as_ref().unwrap().bits, "0000000");
+        assert_eq!(find("OP_ONE").enum_value.as_ref().unwrap().bits, "0000001");
+        assert_eq!(find("OP_NEXT").enum_value.as_ref().unwrap().bits, "0010110");
+        assert_eq!(find("OP_EXPR").enum_value.as_ref().unwrap().bits, "0010011");
+        assert_eq!(find("OP_AFTER_EXPR").enum_value.as_ref().unwrap().bits, "0010100");
+        assert_eq!(find("OP_UNRESOLVED").enum_value, None);
+        assert_eq!(find("OP_AFTER_UNRESOLVED").enum_value, None);
+        assert_eq!(find("OP_AFTER_RESTART").enum_value.as_ref().unwrap().bits, "0100000");
+        assert_eq!(find("OP_MIXED").enum_value.as_ref().unwrap().bits, "0101110");
+        assert_eq!(find("OP_AFTER_MIXED").enum_value.as_ref().unwrap().bits, "0101111");
+        assert_eq!(find("OP_MASKED").enum_value.as_ref().unwrap().bits, "0011000");
+        assert_eq!(find("OP_AFTER_MASKED").enum_value.as_ref().unwrap().bits, "0011001");
+        assert_eq!(find("MIXED_SIGN").enum_value, None);
+        assert_eq!(find("MIXED_SIGN_NEXT").enum_value, None);
+        assert_eq!(find("DIRECT_MIX").enum_value.as_ref().unwrap().bits, "00010001");
+        assert_eq!(find("DIRECT_MIX_NEXT").enum_value.as_ref().unwrap().bits, "00010010");
+        assert_eq!(find("POSITIVE_MIX").enum_value.as_ref().unwrap().bits, "00000111");
+        for (name, bits) in [("NEG_BASE", "1110"), ("NEG_NEXT", "1111"), ("SIGNED_ZERO", "0000")] {
+            assert_eq!(find(name).enum_value, Some(TraceEnumValue { bits: bits.into(), signed: true }));
+        }
+        assert_eq!(find("WIDE_BASE").enum_value, Some(TraceEnumValue {
+            bits: "1".repeat(67) + "0", signed: true,
+        }));
+        assert_eq!(find("WIDE_NEXT").enum_value, Some(TraceEnumValue {
+            bits: "1".repeat(68), signed: true,
+        }));
+    }
+
+    #[test]
+    fn increments_enum_values_across_zero_and_rejects_overflow() {
+        let increment = |bits: &str, signed, offset| {
+            increment_enum_value(bits.into(), signed, offset).map(|value| value.bits)
+        };
+        assert_eq!(increment("110", true, 3).as_deref(), Some("001"));
+        assert_eq!(increment("100", true, 7).as_deref(), Some("011"));
+        assert_eq!(increment("100", true, 8), None);
+        assert_eq!(increment("110", true, 6), None);
+        assert_eq!(increment("011", true, 1), None);
+        assert_eq!(increment("111", false, 1), None);
+        assert_eq!(increment("110", false, 1).as_deref(), Some("111"));
+    }
+
+    #[test]
+    fn traces_enum_initializers_with_resolved_package_constants() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+package settings;
+    parameter RAW = 6'd4;
+    localparam logic [5:0] OFFSET = RAW + 6'd1;
+    localparam logic [7:0] WIDE = 8'd64;
+endpackage
+package states;
+    import settings::RAW;
+    typedef enum logic [5:0] {
+        IDLE = RAW, READY = IDLE + settings::OFFSET, RUN,
+        INVALID = settings::WIDE + 6'd1, UNRESOLVED
+    } state_t;
+endpackage
+module dut #(parameter logic [5:0] RAW = 6'd40)(
+    input wire [5:0] value, output wire /*marker:q*/q
+);
+    import states::*;
+    typedef enum logic [5:0] { INSTANCE = RAW, INSTANCE_NEXT } instance_t;
+    assign q = value == IDLE || value == READY || value == RUN ||
+        value == INVALID || value == UNRESOLVED || value == INSTANCE || value == INSTANCE_NEXT;
+endmodule
+"#,
+            "/enum_names.sv",
+        );
+        let trace = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "q"),
+            TraceDirection::Drivers,
+            TraceBudget { max_depth: 8, max_signals: 32, max_assignments: 32 },
+        ).unwrap().unwrap();
+        let value = |name| {
+            trace.signals.iter().find(|signal| signal.name == name).unwrap().enum_value.as_ref()
+                .map(|value| value.bits.as_str())
+        };
+        assert_eq!(value("IDLE"), Some("000100"));
+        assert_eq!(value("READY"), Some("001001"));
+        assert_eq!(value("RUN"), Some("001010"));
+        for name in ["INVALID", "UNRESOLVED", "INSTANCE", "INSTANCE_NEXT"] {
+            assert_eq!(value(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn traces_enumerated_ranges_in_declaration_order() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+package states;
+    typedef enum logic [4:0] {
+        IDLE, SLOT[2] = 5'd4, UP[3:4], DOWN[7:6] = 5'd16, NEXT
+    } state_t;
+endpackage
+module dut(input wire [4:0] value, output wire /*marker:q*/q);
+    import states::*;
+    assign q = value == SLOT0 || value == states::SLOT1 || value == UP3 ||
+        value == UP4 || value == states::DOWN7 || value == DOWN6 || value == NEXT;
+endmodule
+"#,
+            "/enum_ranges.sv",
+        );
+        let trace = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "q"),
+            TraceDirection::Drivers,
+            TraceBudget { max_depth: 8, max_signals: 32, max_assignments: 32 },
+        ).unwrap().unwrap();
+        let find = |name| trace.signals.iter().find(|signal| signal.name == name).unwrap();
+        for (name, bits) in [
+            ("SLOT0", "00100"), ("SLOT1", "00101"), ("UP3", "00110"), ("UP4", "00111"),
+            ("DOWN7", "10000"), ("DOWN6", "10001"), ("NEXT", "10010"),
+        ] {
+            let signal = find(name);
+            assert_eq!(signal.enum_value.as_ref().unwrap().bits, bits, "{name}");
+            assert!(signal.declaration.is_some(), "{name}");
+        }
+        assert_ne!(find("SLOT0").def, find("SLOT1").def);
+        assert_eq!(find("SLOT0").declaration, find("SLOT1").declaration);
+        assert_ne!(find("DOWN7").def, find("DOWN6").def);
+        assert_eq!(find("DOWN7").declaration, find("DOWN6").declaration);
+    }
 
     #[test]
     fn traces_arbiter_owner_and_keeps_both_continuous_drivers() {
@@ -2501,6 +3713,104 @@ endmodule
     }
 
     #[test]
+    fn separates_startup_initializers_from_scope_entry_initializers() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+module top(input logic clk, value);
+    logic /*marker:module*/module_init = value;
+    if (1) begin : generated
+        logic /*marker:generate*/generate_init = value;
+    end
+    always @(posedge clk) begin : sample
+        static logic /*marker:static*/static_init = value;
+        automatic logic /*marker:automatic*/automatic_init = value;
+        for (int /*marker:loop*/index = 1; index < 2; index++) begin
+        end
+    end
+endmodule
+"#,
+            "/init.sv",
+        );
+        let snapshot = host.make_analysis();
+        for (marker, startup) in [
+            ("module", true),
+            ("generate", true),
+            ("static", true),
+            ("automatic", false),
+            ("loop", false),
+        ] {
+            let trace = snapshot
+                .trace_file_assignments(
+                    position(file, &markers, marker),
+                    TraceDirection::Drivers,
+                    TraceBudget { max_depth: 2, max_signals: 8, max_assignments: 8 },
+                )
+                .unwrap()
+                .unwrap();
+            let initializer = trace.assignments.iter().find(|assignment| {
+                assignment.targets.contains(&trace.root) && assignment.kind == AssignmentKind::Initialization
+            }).expect(marker);
+            assert_eq!(initializer.initialization_at_start, startup, "{marker}");
+            assert_eq!(
+                initializer.inputs.iter().any(|input| matches!(input.kind, AssignmentInputKind::Trigger(_))),
+                !startup,
+                "{marker}",
+            );
+        }
+    }
+
+    #[test]
+    fn identifies_delay_free_continuous_net_writes() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+module top(input logic a,
+    output wire /*marker:output_net*/net_out,
+    output tri /*marker:output_delayed*/delayed_port,
+    output uwire /*marker:output_strength*/strength_port,
+    output logic /*marker:output_variable*/variable_out,
+    output wand /*marker:output_wired_and*/wired_and
+);
+    wire /*marker:initializer*/copied = a;
+    wire /*marker:direct*/direct_out;
+    assign direct_out = ~a;
+    logic /*marker:local_variable*/local_variable;
+    assign local_variable = a;
+    logic /*marker:delayed_variable*/delayed_variable;
+    assign #2 delayed_variable = a;
+    wire /*marker:delayed*/delayed_out;
+    assign #2 delayed_out = a;
+    wire #2 /*marker:netdelay*/delayed_net;
+    assign delayed_net = a;
+    assign net_out = a;
+    assign #2 delayed_port = a;
+    assign (strong0, weak1) strength_port = a;
+    assign variable_out = a;
+    assign wired_and = a;
+endmodule
+"#,
+            "/continuous.sv",
+        );
+        let snapshot = host.make_analysis();
+        for (marker, expected) in [
+            ("initializer", true), ("direct", true), ("delayed", false), ("netdelay", false),
+            ("local_variable", true), ("delayed_variable", false),
+            ("output_net", true), ("output_delayed", false), ("output_strength", false),
+            ("output_variable", false), ("output_wired_and", false),
+        ] {
+            let trace = snapshot
+                .trace_file_assignments(
+                    position(file, &markers, marker),
+                    TraceDirection::Drivers,
+                    TraceBudget { max_depth: 2, max_signals: 8, max_assignments: 8 },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(trace.assignments.len(), 1, "{marker}");
+            assert_eq!(trace.assignments[0].delay_free_continuous, expected, "{marker}");
+        }
+    }
+
+    #[test]
     fn retains_loop_indices_as_elaboration_constants() {
         let (host, file, _, markers) = setup_marked_with_path(
             r#"
@@ -2542,6 +3852,50 @@ endmodule
             Some(AssignmentValue::BitSelect(_, index))
                 if matches!(index.as_ref(), AssignmentValue::GenerateIndex(name) if name == "lane")
         ));
+    }
+
+    #[test]
+    fn identifies_unnamed_generate_ranges_and_shared_source_lines() {
+        let (host, file, _, markers) = setup_marked_with_path(
+            r#"
+module m #(parameter P = 1)(input wire a, b, output wire /*marker:target*/q, /*marker:shared*/r);
+    if (P) assign q = a;
+    else assign q = b;
+    if (P) assign r = a; else assign r = b;
+endmodule
+"#,
+            "/trace.sv",
+        );
+        let trace = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "target"), TraceDirection::Drivers,
+            TraceBudget { max_depth: 4, max_signals: 16, max_assignments: 16 },
+        ).unwrap().unwrap();
+        assert_eq!(trace.assignments.len(), 2);
+        let mut ranges = trace.assignments.iter().map(|assignment| {
+            let [branch] = assignment.generate_branches.as_slice() else {
+                panic!("expected a generate branch");
+            };
+            let selected = branch.selected.as_ref().unwrap();
+            let [other] = branch.alternatives.as_slice() else {
+                panic!("expected the opposite branch");
+            };
+            assert!(selected.name.is_empty() && other.name.is_empty());
+            assert!(selected.unique_line && other.unique_line);
+            assert!(selected.source.range.intersect(other.source.range).is_none());
+            selected.source.range
+        }).collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start());
+        assert!(ranges[0].end() < ranges[1].start());
+
+        let trace = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "shared"), TraceDirection::Drivers,
+            TraceBudget { max_depth: 4, max_signals: 16, max_assignments: 16 },
+        ).unwrap().unwrap();
+        assert_eq!(trace.assignments.len(), 2);
+        for branch in trace.assignments.iter().flat_map(|assignment| &assignment.generate_branches) {
+            assert!(!branch.selected.as_ref().unwrap().unique_line);
+            assert!(!branch.alternatives[0].unique_line);
+        }
     }
 
     #[test]
@@ -2949,6 +4303,74 @@ endmodule
     }
 
     #[test]
+    fn traces_hierarchical_references_in_nested_token_pasting_macros() {
+        use base_db::{change::Change, source_root::SourceRoot};
+        use utils::test_support::TestDir;
+        use vfs::{ChangedFile, FileSet, VfsPath};
+        let dir = TestDir::new("trace-nested-xmr");
+        let mut change = Change::new();
+        let mut file_set = FileSet::default();
+        let mut roots = Vec::new();
+        let mut observation = None;
+        for (index, (path, text)) in [
+            ("/macros.svh", r#"
+`define MID_READ_INNER(which, member) mid_tb.u_``which.member
+`define MID_READ(which, member) `MID_READ_INNER(which, member)
+"#),
+            ("/leaf.sv", r#"
+module mid_leaf(input logic stimulus);
+    wire middle = stimulus;
+endmodule
+"#),
+            ("/observer.sv", r#"
+`include "macros.svh"
+module mid_observer;
+    wire o/*marker:out*/bserved = `MID_READ(leaf, middle);
+endmodule
+"#),
+            ("/tb.sv", r#"
+module mid_tb(input logic stimulus);
+    mid_leaf u_leaf(stimulus);
+    mid_observer u_observer();
+endmodule
+"#),
+        ].into_iter().enumerate() {
+            let path = dir.path().join(path.trim_start_matches('/'));
+            let file = FileId::from_raw(index as u32);
+            let (text, markers) = strip_markers(text.trim_start().to_owned());
+            std::fs::write(&path, &text).unwrap();
+            let include = path.extension() == Some("svh");
+            file_set.insert(file, VfsPath::from(path));
+            change.add_changed_file(ChangedFile::create(file, &text));
+            if !include {
+                roots.push(file);
+            }
+            if !markers.is_empty() {
+                observation = Some((file, markers));
+            }
+        }
+        let (file, markers) = observation.unwrap();
+        change.set_roots(vec![SourceRoot::new_local_with_source_files(file_set, roots)]);
+        let mut host = crate::analysis_host::AnalysisHost::default();
+        host.apply_change(change);
+        let trace = host
+            .make_analysis()
+            .trace_file_assignments(
+                position(file, &markers, "out"),
+                TraceDirection::Drivers,
+                TraceBudget { max_depth: 3, max_signals: 32, max_assignments: 32 },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(trace.assignments.iter().any(|assignment| {
+            assignment.inputs.iter().any(|input| {
+                input.hierarchical_path.as_deref() == Some(&["mid_tb".to_owned(), "u_leaf".to_owned()])
+                    && trace.signals.iter().any(|signal| signal.def == input.signal && signal.name == "middle")
+            })
+        }), "{trace:#?}");
+    }
+
+    #[test]
     fn keeps_hierarchical_read_sites_at_the_instance_boundary() {
         let (host, file, _, markers) = setup_marked_with_path(
             r#"
@@ -2982,6 +4404,8 @@ endmodule
         assert_eq!(assignment.inputs.len(), 2);
         assert!(assignment.inputs.iter().all(|input| input.hierarchical));
         assert_eq!(assignment.inputs[0].signal, assignment.inputs[1].signal);
+        assert_eq!(assignment.inputs[0].hierarchical_path, Some(vec!["left".to_owned()]));
+        assert_eq!(assignment.inputs[1].hierarchical_path, Some(vec!["right".to_owned()]));
         assert_ne!(assignment.inputs[0].location, assignment.inputs[1].location);
         assert!(
             query("state", TraceDirection::Drivers).assignments[0]
@@ -3138,9 +4562,13 @@ endinterface
 module top;
     channel source();
     virtual channel.reader view_handle;
+    virtual channel writer_handle;
     logic /*marker:q*/q;
+    logic /*marker:value*/value;
     initial begin
         view_handle = source.reader;
+        writer_handle = source;
+        /*marker:write*/writer_handle.data = value;
         q = /*marker:access*/view_handle.value;
     end
 endmodule
@@ -3156,6 +4584,19 @@ endmodule
         assert!(trace.frontier.iter().any(|item| matches!(
             item.reason, TraceLimit::VirtualInterfaceBinding(site)
                 if site.file_id == access.file_id && site.range.start() == access.offset
+        )));
+        assert!(trace.signals.iter().all(|signal| signal.name != "view_handle"));
+        let loads = host.make_analysis().trace_file_assignments(
+            position(file, &markers, "value"),
+            TraceDirection::Loads,
+            TraceBudget { max_depth: 8, max_signals: 32, max_assignments: 32 },
+        ).unwrap().unwrap();
+        let [assignment] = loads.assignments.as_slice() else { panic!("expected a virtual write"); };
+        assert!(assignment.targets.is_empty());
+        let write = position(file, &markers, "write");
+        assert!(loads.frontier.iter().any(|item| matches!(
+            item.reason, TraceLimit::VirtualInterfaceBinding(site)
+                if site.file_id == write.file_id && site.range.start() == write.offset
         )));
     }
 
@@ -3259,6 +4700,62 @@ endmodule
                     .any(|stop| matches!(stop.reason, TraceLimit::SubroutineEffects(_)))
             );
         }
+    }
+
+    #[test]
+    fn registered_pli_call_only_adds_possible_writes_to_direct_arguments() {
+        use base_db::{change::Change, source_root::SourceRootId};
+        use base_db::project::{
+            CompilationProfile, CompilationProfileId, ExplicitCompilationInputs, ProjectConfig,
+        };
+        let (mut host, file, _, markers) = setup_marked_with_path(
+            r#"
+module top;
+    logic /*marker:target*/target, value, abandoned;
+    initial begin
+        $registered(target, value + 1);
+        $other(target, abandoned);
+    end
+endmodule
+"#,
+            "/trace.sv",
+        );
+        let mut change = Change::new();
+        change.set_project_config(Arc::new(
+            ProjectConfig::new(
+                vec![Some(CompilationProfileId(0))],
+                vec![CompilationProfile {
+                    source_roots: vec![SourceRootId(0)],
+                    top_modules: Vec::new(),
+                    preprocess: Default::default(),
+                }],
+            )
+            .with_explicit_inputs(vec![ExplicitCompilationInputs {
+                external_system_calls: vec!["$registered".to_owned()],
+                ..ExplicitCompilationInputs::default()
+            }]),
+        ));
+        host.apply_change(change);
+        let trace = host
+            .make_analysis()
+            .trace_file_assignments(
+                position(file, &markers, "target"),
+                TraceDirection::Drivers,
+                TraceBudget { max_depth: 8, max_signals: 32, max_assignments: 32 },
+            )
+            .unwrap()
+            .unwrap();
+        let [call] = trace.assignments.as_slice() else {
+            panic!("expected a single candidate call")
+        };
+        assert_eq!(call.kind, AssignmentKind::SubroutineCall);
+        assert_eq!(call.targets, [trace.root]);
+        assert!(call.has_unresolved_operands);
+        assert!(trace.signals.iter().any(|signal| signal.name == "value"));
+        assert!(!trace.signals.iter().any(|signal| signal.name == "abandoned"));
+        assert!(trace.frontier.iter().any(|stop| matches!(
+            stop.reason, TraceLimit::SubroutineEffects(_)
+        )));
     }
 
     #[test]
@@ -3700,6 +5197,50 @@ endmodule
     }
 
     #[test]
+    fn retains_case_guards_for_wide_instruction_decoders() {
+        let labels = (0..48).map(|value| format!("7'd{value}")).collect::<Vec<_>>();
+        let source = format!(
+            "module top(input logic [6:0] opcode, input logic a, b, output logic /*marker:out*/q);
+             always_comb case (opcode)
+                 {}: q = a;
+                 {}: q = b;
+                 default: q = 0;
+             endcase
+             endmodule",
+            labels[..40].join(", "),
+            labels[40..].join(", "),
+        );
+        let (host, file, _, markers) = setup_marked_with_path(&source, "/trace.sv");
+        let trace = host
+            .make_analysis()
+            .trace_file_assignments(
+                position(file, &markers, "out"),
+                TraceDirection::Drivers,
+                TraceBudget { max_depth: 2, max_signals: 16, max_assignments: 16 },
+            )
+            .unwrap()
+            .unwrap();
+        let second = trace.assignments.iter().find(|assignment| {
+            assignment.inputs.iter().any(|input| {
+                input.kind == AssignmentInputKind::Data
+                    && trace.signals.iter().any(|signal| signal.def == input.signal && signal.name == "b")
+            })
+        }).expect("the second case arm");
+        assert!(!second.has_unresolved_operands);
+        let [first, second] = second.guards.as_slice() else {
+            panic!("expected the priority check and active case arm");
+        };
+        for (guard, expected, selected) in [(first, [0, 40], false), (second, [40, 48], true)] {
+            assert_eq!(guard.taken_when_true, selected);
+            assert!(matches!(
+                &guard.expression,
+                Some(GuardExpression::Value(AssignmentValue::CaseMatch(_, labels, range, CaseMatchKind::Equal)))
+                    if labels.len() == 48 && *range == expected
+            ));
+        }
+    }
+
+    #[test]
     fn indexes_declaration_drivers_and_case_dependencies() {
         let (host, file, _, markers) = setup_marked_with_path(
             r#"
@@ -3758,9 +5299,13 @@ endmodule
         }
         assert!(matches!(
             trace.assignments[0].guards[0].expression,
-            Some(GuardExpression::Value(AssignmentValue::Binary(ValueBinary::CaseItemEqual, ..)))
+            Some(GuardExpression::Value(AssignmentValue::CaseMatch(_, ref labels, [0, 1], CaseMatchKind::Equal)))
+                if labels[1] == vec![AssignmentValue::TypeShape(1, false)]
         ));
-        assert!(matches!(trace.assignments[1].guards[1].expression, Some(GuardExpression::Or(..))));
+        assert!(matches!(
+            trace.assignments[1].guards[1].expression,
+            Some(GuardExpression::Value(AssignmentValue::CaseMatch(_, _, [1, 3], CaseMatchKind::Equal)))
+        ));
         assert_eq!(trace.assignments[3].kind, AssignmentKind::Continuous);
         assert_eq!(names[&trace.assignments[3].inputs[0].signal], "data");
         assert_eq!(trace.assignments[4].kind, AssignmentKind::Initialization);
@@ -3859,10 +5404,64 @@ endmodule
         let guard = trace.assignments[0].guards[0].expression.clone().unwrap();
         assert!(matches!(
             guard,
-            GuardExpression::Value(AssignmentValue::Binary(ValueBinary::CaseItemZ, _, label))
-                if *label == AssignmentValue::Literal("1z".into(), false)
+            GuardExpression::Value(AssignmentValue::CaseMatch(_, labels, [0, 1], CaseMatchKind::WildcardZ))
+                if labels[0] == vec![AssignmentValue::Literal("1z".into(), false)]
         ));
         assert!(!trace.assignments[1].guards[0].taken_when_true);
+    }
+
+    #[test]
+    fn preserves_inside_ranges_and_case_item_priority() {
+        let (host, file, text, markers) = setup_marked_with_path(
+            r#"
+module tb(input logic [3:0] sel, input logic a, b, c);
+    logic /*marker:out*/out;
+    always_comb case (sel) inside
+        default: out = c;
+        [4'd4:4'd6], 4'b10?1: out = a;
+        8'b000010??: out = b;
+    endcase
+endmodule
+"#,
+            "/membership.sv",
+        );
+        let trace = host
+            .make_analysis()
+            .trace_file_assignments(
+                position(file, &markers, "out"),
+                TraceDirection::Drivers,
+                TraceBudget { max_depth: 1, max_signals: 16, max_assignments: 8 },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(trace.assignments.len(), 3);
+        for assignment in trace.assignments {
+            assert!(!assignment.has_unresolved_operands);
+            let taken = assignment
+                .guards
+                .iter()
+                .map(|guard| {
+                    let Some(GuardExpression::Value(AssignmentValue::CaseMatch(
+                        _,
+                        labels,
+                        span,
+                        CaseMatchKind::Inside,
+                    ))) = &guard.expression
+                    else {
+                        panic!("expected an inside comparison");
+                    };
+                    assert_eq!(labels.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1, 1]);
+                    assert_eq!(labels[1], vec![AssignmentValue::Literal("10z1".into(), false)]);
+                    (*span, guard.taken_when_true)
+                })
+                .collect::<Vec<_>>();
+            match &text[assignment.location.range] {
+                "out = a" => assert_eq!(taken, [([0, 2], true)]),
+                "out = b" => assert_eq!(taken, [([0, 2], false), ([2, 3], true)]),
+                "out = c" => assert_eq!(taken, [([0, 2], false), ([2, 3], false)]),
+                other => panic!("unexpected assignment {other}"),
+            }
+        }
     }
 
     #[test]

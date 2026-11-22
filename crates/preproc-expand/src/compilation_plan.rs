@@ -31,6 +31,7 @@ pub struct CompilationPlan {
     pub include_dirs: Vec<AbsPathBuf>,
     pub top_modules: Vec<String>,
     pub parameter_overrides: Vec<String>,
+    pub default_timescale: Option<String>,
     pub predefines: Vec<String>,
     pub include_scan_issues: Vec<IncludeScanIssue>,
     pub missing_ordered_sources: Vec<AbsPathBuf>,
@@ -324,6 +325,7 @@ impl CompilationPlan {
             parameter_overrides: explicit
                 .map(|inputs| inputs.parameter_overrides.clone())
                 .unwrap_or_default(),
+            default_timescale: explicit.and_then(|inputs| inputs.default_timescale.clone()),
             predefines,
             include_scan_issues,
             missing_ordered_sources,

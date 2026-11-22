@@ -322,6 +322,7 @@ struct DefinitionData {
 pub(crate) struct DefinitionTable {
     definitions: FxHashMap<LocalDefId, DefinitionData>,
     by_source: FxHashMap<(SourceAstId, DefKind), LocalDefId>,
+    generated_enum_members: FxHashMap<(SourceAstId, SmolStr), LocalDefId>,
     next_ordinals: FxHashMap<DefinitionNameKey, u32>,
 }
 
@@ -337,13 +338,17 @@ impl DefinitionTable {
             !self.by_source.contains_key(&source_key),
             "definition source inserted twice: {source:?} {kind:?}"
         );
+        let local = self.next_named_id(kind, name);
+        self.by_source.insert(source_key, local.clone());
+        local
+    }
+
+    fn next_named_id(&mut self, kind: DefKind, name: Option<SmolStr>) -> LocalDefId {
         let name_key = DefinitionNameKey { kind, name };
         let ordinal = self.next_ordinals.entry(name_key.clone()).or_default();
         let key = DefinitionKey { name: name_key, ordinal: *ordinal };
         *ordinal += 1;
-        let local = LocalDefId(key);
-        self.by_source.insert(source_key, local.clone());
-        local
+        LocalDefId(key)
     }
 
     fn insert(
@@ -356,6 +361,20 @@ impl DefinitionTable {
         self.definitions
             .insert(local.clone(), DefinitionData { primary, additional: SmallVec::new() });
         local
+    }
+
+    fn insert_generated_enum_member(
+        &mut self,
+        source: SourceAstId,
+        name: SmolStr,
+        primary: DefOriginLoc,
+    ) {
+        let kind = DefKind::EnumMember;
+        let local = self.next_named_id(kind, Some(name.clone()));
+        self.generated_enum_members.insert((source, name), local.clone());
+        // The shared declaration token resolves to the first generated name.
+        self.by_source.entry((source, kind)).or_insert_with(|| local.clone());
+        self.definitions.insert(local, DefinitionData { primary, additional: SmallVec::new() });
     }
 
     fn alias(
@@ -491,14 +510,16 @@ pub(crate) fn definition_table(db: &dyn HirDefDb, owner: OwnerId) -> Arc<Definit
     // stable identities so navigation and hover can target their source names.
     for (enum_id, enum_def) in body.enums.iter() {
         for (index, member) in enum_def.members.iter().enumerate() {
-            table.insert(
-                db,
-                member.source,
-                DefOriginLoc::EnumMember {
-                    enum_id: OwnerRef::new(owner, enum_id),
-                    index: index as u32,
-                },
-            );
+            let origin = DefOriginLoc::EnumMember {
+                enum_id: OwnerRef::new(owner, enum_id),
+                index: index as u32,
+            };
+            if member.generated {
+                let name = member.name.clone().expect("generated enum member name");
+                table.insert_generated_enum_member(member.source, name, origin);
+            } else {
+                table.insert(db, member.source, origin);
+            }
         }
     }
     for (struct_id, struct_def) in body.structs.iter() {
@@ -599,10 +620,17 @@ impl DefId {
             .expect("every semantic definition must have a source AST identity")
             .value;
         let kind = loc.clone().kind(db);
-        let local = db
-            .definition_table(owner)
-            .local_for(source, kind)
-            .expect("definition origin must be collected by its owner");
+        let table = db.definition_table(owner);
+        let local = match &loc {
+            DefOriginLoc::EnumMember { enum_id, index }
+                if db.body(enum_id.cont_id).enum_def(enum_id.value).members[*index as usize]
+                    .generated =>
+            {
+                loc.name(db).and_then(|name| table.generated_enum_members.get(&(source, name)).cloned())
+            }
+            _ => table.local_for(source, kind),
+        }
+        .expect("definition origin must be collected by its owner");
         Self(InternedDefId::new(db, owner, local))
     }
 

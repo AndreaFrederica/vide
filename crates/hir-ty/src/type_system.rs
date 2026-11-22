@@ -3,9 +3,10 @@ use hir_def::{
     container::OwnerRef,
     def_id::DefId,
     expr::{
-        ExprId,
+        Expr, ExprId, UnaryOp,
         data_ty::{BuiltinDataTy, Dimension, TypePathRecovery},
     },
+    literal::Literal,
     module::ModuleKind,
     owner::OwnerId,
     subroutine::SubroutineKind,
@@ -16,7 +17,7 @@ use syntax::SyntaxKind;
 use triomphe::Arc;
 
 use crate::{
-    compatibility::{compatibility, is_typed_value},
+    compatibility::{compatibility, is_typed_value, packed_bit_width},
     db::TyDb,
     display::{HirDisplay, HirDisplayError},
     infer::normalize_data_ty,
@@ -112,6 +113,75 @@ impl<'db> TypeSystem<'db> {
 
     pub fn type_of_def(&self, def: DefId) -> Type {
         self.type_of_resolution(Resolution::Unique(def))
+    }
+
+    pub fn packed_integer_width_of_def(&self, def: DefId) -> Option<u64> {
+        let ty = self.type_of_def(def);
+        packed_bit_width(self.db, ty.ty())
+    }
+
+    pub fn literal_packed_range_of_def(&self, def: DefId) -> Option<[i32; 2]> {
+        let declaration = def.declaration_origin(self.db).as_decl(self.db)?;
+        let declarations = declaration.cont_id.data(self.db);
+        if !declarations.declarator(declaration.value).dimensions.is_empty() {
+            return None;
+        }
+        let inferred = self.type_of_def(def);
+        let mut ty = inferred.ty();
+        while let Ty::Alias { target, .. } = ty {
+            ty = target;
+        }
+        let Ty::Builtin(BuiltinTy::Data { id, container }) = ty else {
+            return None;
+        };
+        let BuiltinDataTy::Vector { dimensions, .. } = id.get() else {
+            return None;
+        };
+        match dimensions.as_slice() {
+            [] => Some([0, 0]),
+            [Some(Dimension::Range(left, right))] => {
+                let data = container.data(self.db);
+                let bound = |expr| {
+                    let (literal, negative) = match data.expr(expr) {
+                        Expr::Unary { op: UnaryOp::Neg, expr } => (data.expr(*expr), true),
+                        Expr::Unary { op: UnaryOp::Pos, expr } => (data.expr(*expr), false),
+                        literal => (literal, false),
+                    };
+                    let Expr::Literal(Literal::Int(value)) = literal else {
+                        return None;
+                    };
+                    let value: i64 = value.serialize(10).parse().ok()?;
+                    let value = if negative { value.checked_neg()? } else { value };
+                    value.try_into().ok()
+                };
+                Some([bound(*left)?, bound(*right)?])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn enum_member_packed_shape(&self, def: DefId) -> Option<(u64, bool)> {
+        let DefOriginLoc::EnumMember { enum_id, .. } = def.declaration_origin(self.db).loc(self.db)
+        else {
+            return None;
+        };
+        let data = enum_id.cont_id.data(self.db);
+        let Some(base) = data.enum_def(enum_id.value).base_ty.clone() else {
+            return Some((32, true));
+        };
+        let resolved = normalize_data_ty(self.db, enum_id.cont_id, base);
+        let mut ty = &resolved.ty;
+        while let Ty::Alias { target, .. } = ty {
+            ty = target;
+        }
+        let Ty::Builtin(BuiltinTy::Data { id, .. }) = ty else {
+            return None;
+        };
+        let signed = match id.get() {
+            BuiltinDataTy::Int { signing, .. } | BuiltinDataTy::Vector { signing, .. } => *signing,
+            _ => return None,
+        };
+        Some((packed_bit_width(self.db, ty)?, signed))
     }
 
     pub fn packed_signedness_of_def(&self, def: DefId) -> Option<bool> {
