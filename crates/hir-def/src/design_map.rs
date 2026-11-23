@@ -264,6 +264,7 @@ impl DesignMap {
     pub fn resolve_import(
         &self,
         db: &dyn HirDefDb,
+        source: HirFileId,
         import: &Import,
         ident: &SmolStr,
         ctx: NameContext,
@@ -274,7 +275,10 @@ impl DesignMap {
             return Resolution::Unresolved;
         }
 
-        let packages = db.unit_index().package_ids(&import.package);
+        let packages =
+            db.project_resolution(source, db.unit_index().package_ids(&import.package), |owner| {
+                owner.file(db)
+            });
         packages.and_then(|package| {
             let Some(exports) = self.package_exports.get(&package) else {
                 return Resolution::Unresolved;
@@ -333,17 +337,18 @@ pub fn design_map(db: &dyn HirDefDb) -> Arc<DesignMap> {
                 .clone();
 
             let mut add_reexport = |source_package: &Ident, item: Option<&Ident>| {
-                let names = item.map(|item| vec![item.clone()]).unwrap_or_else(|| {
-                    imported_names(&exports, unit_index.package_ids(source_package))
-                });
+                let candidates = db.project_resolution(
+                    package.file(db),
+                    unit_index.package_ids(source_package),
+                    |owner| owner.file(db),
+                );
+                let names = item
+                    .map(|item| vec![item.clone()])
+                    .unwrap_or_else(|| imported_names(&exports, candidates.clone()));
                 for name in names {
                     for ctx in [NameContext::Type, NameContext::Value, NameContext::Assertion] {
-                        let resolution = resolve_package_member(
-                            &exports,
-                            unit_index.package_ids(source_package),
-                            &name,
-                            ctx,
-                        );
+                        let resolution =
+                            resolve_package_member(&exports, candidates.clone(), &name, ctx);
                         next.insert_resolution(ctx, &name, resolution);
                     }
                 }

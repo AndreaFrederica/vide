@@ -102,6 +102,25 @@ impl dyn HirDefDb + '_ {
         crate::scope::unit_scope(self)
     }
 
+    pub(crate) fn project_resolution<T: Eq>(
+        &self,
+        source: HirFileId,
+        resolution: crate::symbol::Resolution<T>,
+        file_of: impl Fn(&T) -> HirFileId,
+    ) -> crate::symbol::Resolution<T> {
+        let Some(profile) =
+            source.source_file_id(self).and_then(|file| self.file_compilation_profile(file))
+        else {
+            return resolution;
+        };
+        let plan = self.compilation_plan_for_profile(Some(profile));
+        crate::symbol::Resolution::from_candidates(resolution.into_candidates().into_iter().filter(
+            |item| {
+                file_of(item).source_file_id(self).is_some_and(|file| plan.contains_source(file))
+            },
+        ))
+    }
+
     pub fn unit_index(&self) -> Arc<crate::unit_index::UnitIndex> {
         unit_index::unit_index(self)
     }

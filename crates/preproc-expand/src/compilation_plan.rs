@@ -50,6 +50,10 @@ pub enum IncludeScanIssueReason {
 }
 
 impl CompilationPlan {
+    pub fn contains_source(&self, file: FileId) -> bool {
+        self.roots.contains(&file) || self.include_only.contains(&file)
+    }
+
     pub fn source_library(&self, file: FileId) -> &str {
         self.source_libraries
             .iter()

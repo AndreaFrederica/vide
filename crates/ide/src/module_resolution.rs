@@ -92,29 +92,35 @@ pub(crate) fn resolve_module_name(
     name: &Ident,
 ) -> ModuleResolution {
     let policy = ModuleResolutionPolicy::for_file(db, from_file);
-    let profile = db.file_compilation_profile(from_file);
-    if db
-        .project_config()
-        .explicit_inputs(profile)
-        .is_some_and(|inputs| !inputs.source_libraries.is_empty())
-    {
-        let plan = db.compilation_plan_for_profile(profile);
-        let library = plan.source_library(from_file);
-        let local = module_candidates(db, name)
-            .into_iter()
-            .filter(|owner| {
-                owner.file(db).source_file_id(db).is_some_and(|file| {
-                    plan.roots.contains(&file) && plan.source_library(file) == library
+    let mut candidates = module_candidates(db, name);
+    if let Some(profile) = db.file_compilation_profile(from_file) {
+        let plan = db.compilation_plan_for_profile(Some(profile));
+        candidates.retain(|owner| {
+            owner.file(db).source_file_id(db).is_some_and(|file| plan.contains_source(file))
+        });
+        if !plan.source_libraries.is_empty() {
+            let library = plan.source_library(from_file);
+            let local = candidates
+                .iter()
+                .copied()
+                .filter(|owner| {
+                    owner.file(db).source_file_id(db).is_some_and(|file| {
+                        plan.roots.contains(&file) && plan.source_library(file) == library
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        match local.as_slice() {
-            [owner] => return ModuleResolution::Unique(*owner),
-            [] => {}
-            _ => return policy.resolve_ambiguous(db, local),
+                .collect::<Vec<_>>();
+            match local.as_slice() {
+                [owner] => return ModuleResolution::Unique(*owner),
+                [] => {}
+                _ => return policy.resolve_ambiguous(db, local),
+            }
         }
     }
-    resolve_module_name_with_policy(db, name, policy)
+    match candidates.as_slice() {
+        [module_id] => ModuleResolution::Unique(*module_id),
+        [] => ModuleResolution::Unresolved,
+        _ => policy.resolve_ambiguous(db, candidates),
+    }
 }
 
 pub(crate) fn resolve_named_port_connection(
@@ -318,19 +324,6 @@ pub(crate) fn resolve_named_param_in_module(
     }))
 }
 
-fn resolve_module_name_with_policy(
-    db: &dyn WorkspaceSymbolIndexDb,
-    name: &Ident,
-    policy: ModuleResolutionPolicy,
-) -> ModuleResolution {
-    let candidates = module_candidates(db, name);
-    match candidates.as_slice() {
-        [module_id] => ModuleResolution::Unique(*module_id),
-        [] => ModuleResolution::Unresolved,
-        _ => policy.resolve_ambiguous(db, candidates),
-    }
-}
-
 fn module_candidates(db: &dyn WorkspaceSymbolIndexDb, name: &Ident) -> Vec<OwnerId> {
     let mut candidates = Vec::new();
     for source_root_id in db.workspace_source_root_ids().iter().copied() {
@@ -489,7 +482,11 @@ fn dir_ancestors(path: VfsPath) -> Vec<VfsPath> {
 mod tests {
     use std::path::Path;
 
-    use base_db::{change::Change, source_root::SourceRoot};
+    use base_db::{
+        change::Change,
+        project::{CompilationProfile, CompilationProfileId, ProjectConfig},
+        source_root::{SourceRoot, SourceRootId},
+    };
     use hir_def::symbol::{DefKind, Resolution};
     use smol_str::SmolStr;
     use syntax::{SyntaxNodeExt, ast};
@@ -498,6 +495,48 @@ mod tests {
 
     use super::*;
     use crate::db::root_db::RootDb;
+
+    #[test]
+    fn configured_projects_resolve_their_own_modules_and_shared_library() {
+        let mut db = RootDb::new(None);
+        let mut change = Change::new();
+        let mut roots = Vec::new();
+        for (index, directory) in ["editing", "simulation", "shared"].into_iter().enumerate() {
+            let file = FileId::from_raw(index as u32);
+            let mut files = FileSet::default();
+            files.insert(file, VfsPath::new_virtual_path(format!("/{directory}/design.sv")));
+            roots.push(SourceRoot::new_local(files));
+            let text = if directory == "shared" {
+                "module common; endmodule"
+            } else {
+                "module child; endmodule"
+            };
+            change.add_changed_file(ChangedFile::create(file, text));
+        }
+        change.set_roots(roots);
+        change.set_project_config(
+            ProjectConfig::new(
+                vec![Some(CompilationProfileId(0)), Some(CompilationProfileId(1)), None],
+                [SourceRootId(0), SourceRootId(1)]
+                    .into_iter()
+                    .map(|root| CompilationProfile {
+                        source_roots: vec![root, SourceRootId(2)],
+                        top_modules: Vec::new(),
+                        preprocess: Default::default(),
+                    })
+                    .collect(),
+            )
+            .into(),
+        );
+        db.apply_change(change);
+        for index in 0..2 {
+            let file = FileId::from_raw(index);
+            let local = resolve_module_name(&db, file, &"child".into()).unique().unwrap();
+            assert_eq!(local.file(&db).as_file(), Some(file));
+            let shared = resolve_module_name(&db, file, &"common".into()).unique().unwrap();
+            assert_eq!(shared.file(&db).as_file(), Some(FileId::from_raw(2)));
+        }
+    }
 
     fn db_with_root(
         files: &[(String, String)],

@@ -195,7 +195,7 @@ fn resolve_name_inner(
             .is_some_and(|inputs| inputs.compilation_units.is_some())
             .then_some((file, profile))
     });
-    let mut unit = db.unit_scope().lookup(ctx, ident);
+    let mut unit = resolve_unit_name(db, cont_id, ident, ctx);
     if let Some((file, profile)) = explicit_profile {
         let plan = db.compilation_plan_for_profile(profile);
         if let Some(files) = plan
@@ -307,7 +307,21 @@ pub fn resolve_in_resolved_scopes_at(
             return imported;
         }
     }
-    db.unit_scope().lookup(ctx, ident)
+    let Some(owner) = resolved.scope_chain.iter().next() else {
+        return Resolution::Unresolved;
+    };
+    resolve_unit_name(db, *owner, ident, ctx)
+}
+
+fn resolve_unit_name(
+    db: &dyn HirDefDb,
+    owner: OwnerId,
+    ident: &Ident,
+    ctx: NameContext,
+) -> Resolution<DefId> {
+    db.project_resolution(owner.file(db), db.unit_scope().lookup(ctx, ident), |def| {
+        def.container_id(db).file(db)
+    })
 }
 
 pub fn resolve_path(
@@ -651,8 +665,10 @@ impl ImportCollector<'_> {
             {
                 continue;
             }
-            for def_id in
-                self.design_map.resolve_import(self.db, import, ident, ctx).into_candidates()
+            for def_id in self
+                .design_map
+                .resolve_import(self.db, self.scope_file, import, ident, ctx)
+                .into_candidates()
             {
                 if !self.defs.contains(&def_id) {
                     self.defs.push(def_id);
